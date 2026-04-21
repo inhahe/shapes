@@ -18,6 +18,7 @@ Usage:
     python bouncing_glyphs.py --gravity 500 --restitution 0.9
     python bouncing_glyphs.py --unicode --colorful --count 30
     python bouncing_glyphs.py --friction 0.3 --gravity 500    (realistic friction + gravity)
+    python bouncing_glyphs.py --goal --sound --gravity 400    (goal mode with sounds)
     python bouncing_glyphs.py --color "255,100,0" --font-size 100 --debug
 
 Interactive keys:
@@ -678,8 +679,11 @@ def _resolve_wall(body, cp, n, depth):
     return j
 
 
-def handle_walls(body, W, H):
+def handle_walls(body, W, H, goal=None):
     """Detect and resolve wall penetration (deepest vertex per wall).
+
+    *goal*: ``None`` or ``(left_x, right_x)`` — a gap in the top wall
+    where glyphs can pass through.
 
     Returns the largest wall impulse magnitude this frame (for sound).
     """
@@ -704,14 +708,70 @@ def handle_walls(body, W, H):
     if cp:
         max_j = max(max_j, _resolve_wall(body, cp, (-1.0, 0.0), worst))
 
-    # Top wall  (normal = +y)
+    # Top wall  (normal = +y) — skip vertices inside goal gap
     worst, cp = 0.0, None
     for v in verts:
+        if goal and goal[0] <= v[0] <= goal[1]:
+            continue   # gap — let it through
         d = -v[1]
         if d > worst:
             worst, cp = d, v
     if cp:
         max_j = max(max_j, _resolve_wall(body, cp, (0.0, 1.0), worst))
+
+    # Goal posts — vertical wall segments at x=goal_left and x=goal_right,
+    # extending from y=0 down to POST_H into the play area.  Which face
+    # pushes the glyph depends on which side of the post the body centre is.
+    if goal:
+        gl, gr = goal
+        POST_H = 40.0
+        # Broad phase: skip bodies whose bounding circle is below the posts
+        if body.py - body.radius < POST_H:
+            # -- Left post at x = gl --
+            worst, cp = 0.0, None
+            if body.px < gl:
+                # Body is left of goal → push stray vertices LEFT
+                for v in verts:
+                    if 0 < v[1] < POST_H:
+                        d = v[0] - gl
+                        if d > worst:
+                            worst, cp = d, v
+                if cp:
+                    max_j = max(max_j,
+                                _resolve_wall(body, cp, (-1.0, 0.0), worst))
+            else:
+                # Body is inside/right of goal → push stray vertices RIGHT
+                for v in verts:
+                    if 0 < v[1] < POST_H:
+                        d = gl - v[0]
+                        if d > worst:
+                            worst, cp = d, v
+                if cp:
+                    max_j = max(max_j,
+                                _resolve_wall(body, cp, (1.0, 0.0), worst))
+
+            # -- Right post at x = gr --
+            worst, cp = 0.0, None
+            if body.px > gr:
+                # Body is right of goal → push stray vertices RIGHT
+                for v in verts:
+                    if 0 < v[1] < POST_H:
+                        d = gr - v[0]
+                        if d > worst:
+                            worst, cp = d, v
+                if cp:
+                    max_j = max(max_j,
+                                _resolve_wall(body, cp, (1.0, 0.0), worst))
+            else:
+                # Body is inside/left of goal → push stray vertices LEFT
+                for v in verts:
+                    if 0 < v[1] < POST_H:
+                        d = v[0] - gr
+                        if d > worst:
+                            worst, cp = d, v
+                if cp:
+                    max_j = max(max_j,
+                                _resolve_wall(body, cp, (-1.0, 0.0), worst))
 
     # Bottom wall  (normal = -y)
     worst, cp = 0.0, None
@@ -854,6 +914,11 @@ def main():
                     help="Glyph colour name or R,G,B (default: white)")
     ap.add_argument("--sound",       action="store_true",
                     help="Play a click on every collision (volume ~ impact force)")
+    ap.add_argument("--goal",        action="store_true",
+                    help="Add a goal opening in the top wall. Glyphs that pass "
+                         "through disappear and respawn as new random glyphs.")
+    ap.add_argument("--goal-width",  default=150, type=int,
+                    help="Width of the goal opening in pixels (default: 150)")
     ap.add_argument("--debug",       action="store_true",
                     help="Draw convex-hull wireframes")
     ap.add_argument("--seed",        default=None, type=int,
@@ -879,20 +944,50 @@ def main():
 
     # ---- Sound ----
     click_sound = None
-    if args.sound:
+    goal_exit_sound = None
+    goal_enter_sound = None
+    want_sound = args.sound or args.goal   # goal implies sound for its events
+    if want_sound:
         try:
             pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
-            # Generate a short damped click (~12 ms)
+            pygame.mixer.set_num_channels(16)
             _sr = 44100
-            _dur = 0.012
-            _ns = int(_sr * _dur)
+
+            # Collision click (~12 ms damped sine)
+            _ns = int(_sr * 0.012)
             _buf = array.array("h", (
                 int(8000 * math.exp(-i / _sr * 500) *
                     math.sin(2 * math.pi * 900 * i / _sr))
                 for i in range(_ns)
             ))
             click_sound = pygame.mixer.Sound(buffer=_buf)
-            pygame.mixer.set_num_channels(16)
+
+            # Goal exit: "cha-ching" — two quick ascending metallic tones
+            _buf2 = array.array("h")
+            for i in range(int(_sr * 0.05)):        # tone 1: 880 Hz, 50 ms
+                t = i / _sr
+                _buf2.append(int(6000 * math.exp(-t * 40) *
+                                 math.sin(2 * math.pi * 880 * t)))
+            for _ in range(int(_sr * 0.03)):         # 30 ms gap
+                _buf2.append(0)
+            for i in range(int(_sr * 0.07)):        # tone 2: 1320 Hz, 70 ms
+                t = i / _sr
+                _buf2.append(int(8000 * math.exp(-t * 30) *
+                                 math.sin(2 * math.pi * 1320 * t)))
+            goal_exit_sound = pygame.mixer.Sound(buffer=_buf2)
+            goal_exit_sound.set_volume(0.6)
+
+            # Goal enter: gentle rising "bwoop" (60 ms, 300 -> 700 Hz)
+            _buf3 = array.array("h")
+            _nd = int(_sr * 0.06)
+            for i in range(_nd):
+                t = i / _sr
+                f = 300 + 400 * (i / _nd)
+                _buf3.append(int(5000 * math.exp(-t * 35) *
+                                 math.sin(2 * math.pi * f * t)))
+            goal_enter_sound = pygame.mixer.Sound(buffer=_buf3)
+            goal_enter_sound.set_volume(0.5)
+
         except Exception as exc:
             print(f"Sound init failed ({exc}); continuing without sound.")
 
@@ -960,6 +1055,17 @@ def main():
             b.omega = random.uniform(-3.0, 3.0)
             bodies.append(b)
     print(f"Bodies spawned   : {len(bodies)}")
+
+    # ---- Goal setup ----
+    goal = None
+    respawn_queue: list[list] = []   # [[delay, vx, vy, omega], ...]
+    if args.goal:
+        gl = args.width / 2 - args.goal_width / 2
+        gr = args.width / 2 + args.goal_width / 2
+        goal = (gl, gr)
+        print(f"Goal             : top wall, x=[{gl:.0f}, {gr:.0f}] "
+              f"({args.goal_width}px wide)")
+
     vsync_str = "vsync" if use_vsync else "60fps"
     sound_str = "  S=sound toggle" if click_sound else ""
     print(f"Display          : {args.width}x{args.height} {vsync_str}")
@@ -976,6 +1082,7 @@ def main():
     paused = False
     debug = args.debug
     gravity = args.gravity
+    goal_score = 0
 
     while running:
         # vsync: flip() already blocked, just measure dt.
@@ -1039,12 +1146,46 @@ def main():
 
             # ---- Wall collisions (fresh verts after body-body resolution) ----
             for b in bodies:
-                wj = handle_walls(b, args.width, args.height)
+                wj = handle_walls(b, args.width, args.height, goal)
                 if wj > 0 and click_sound and args.sound:
                     vol = min(1.0, max(0.05, math.log1p(wj) / 7.0))
                     click_sound.set_volume(vol)
                     click_sound.play()
                 frame_max_j = max(frame_max_j, wj)
+
+            # ---- Goal: exit detection ----
+            if goal:
+                gl, gr = goal
+                exited = [i for i, b in enumerate(bodies)
+                          if gl < b.px < gr and b.py < 0]
+                for i in reversed(exited):
+                    b = bodies.pop(i)
+                    respawn_queue.append([random.uniform(1.0, 4.0),
+                                         b.vx, b.vy, b.omega])
+                    goal_score += 1
+                    if goal_exit_sound:
+                        goal_exit_sound.play()
+
+            # ---- Goal: respawn queue ----
+            if respawn_queue:
+                for entry in respawn_queue[:]:
+                    entry[0] -= dt
+                    if entry[0] <= 0:
+                        respawn_queue.remove(entry)
+                        _, evx, evy, eomega = entry
+                        ch = random.choice(usable)
+                        # Enter at the goal opening, velocity reflected off wall
+                        gx = random.uniform(goal[0] + 20, goal[1] - 20)
+                        color = _bright_color() if args.colorful else base_color
+                        nb = make_body(ch, outlines[ch], pg_font,
+                                       (gx, args.font_size * 0.6),
+                                       (evx, abs(evy) if evy < 0 else evy),
+                                       args.restitution, color)
+                        if nb is not None:
+                            nb.omega = -eomega
+                            bodies.append(nb)
+                            if goal_enter_sound:
+                                goal_enter_sound.play()
 
         # ---- Render ----
         screen.fill((12, 12, 20))
@@ -1065,10 +1206,30 @@ def main():
                     pygame.draw.line(screen, (255, 80, 80), (cx - 4, cy), (cx + 4, cy))
                     pygame.draw.line(screen, (255, 80, 80), (cx, cy - 4), (cx, cy + 4))
 
+        # ---- Goal rendering ----
+        if goal:
+            gl, gr = goal
+            post_h = 35   # visual post height (cosmetic only)
+            # Subtle glow in the goal opening
+            glow = pygame.Surface((int(gr - gl), 4), pygame.SRCALPHA)
+            glow.fill((80, 180, 80, 40))
+            screen.blit(glow, (int(gl), 0))
+            # Posts
+            pygame.draw.line(screen, (80, 200, 80),
+                             (int(gl), 0), (int(gl), post_h), 3)
+            pygame.draw.line(screen, (80, 200, 80),
+                             (int(gr), 0), (int(gr), post_h), 3)
+            # Waiting indicator: dots for queued respawns
+            for qi in range(len(respawn_queue)):
+                dx = int(gl + (gr - gl) * (qi + 1) / (len(respawn_queue) + 1))
+                pygame.draw.circle(screen, (80, 200, 80), (dx, 12), 3)
+
         # ---- HUD ----
         fps = clock.get_fps()
         status = "PAUSED" if paused else f"{fps:.0f} fps"
         hud = f"{status}  |  {len(bodies)} glyphs  |  gravity={'ON' if gravity else 'OFF'}"
+        if goal:
+            hud += f"  |  goals: {goal_score}  queue: {len(respawn_queue)}"
         if debug:
             hud += "  |  DEBUG"
         hud_font.render_to(screen, (8, 6), hud, fgcolor=(90, 90, 110))

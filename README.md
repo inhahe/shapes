@@ -42,6 +42,9 @@ python bouncing_glyphs.py --unicode --colorful --count 30
 # Realistic: friction slows sliding, gravity pulls down, slight energy loss
 python bouncing_glyphs.py --friction 0.3 --gravity 500 --restitution 0.9
 
+# Goal mode: glyphs exit through the top, respawn as new characters
+python bouncing_glyphs.py --goal --sound --gravity 400 --count 20
+
 # DOS/BBS box-drawing characters with collision sounds
 python bouncing_glyphs.py --cp437 --sound --colorful --count 20
 
@@ -76,6 +79,8 @@ python bouncing_glyphs.py --chars "HELLO" --count 5 --font-size 100
 | `--colorful` | off | Each glyph gets a random saturated colour. Without this flag, all glyphs are the same colour. |
 | `--color C` | `white` | Base colour for all glyphs (when `--colorful` is not set). Accepts a pygame colour name (`red`, `cyan`, `gold`, ...) or `R,G,B` like `"255,100,0"`. |
 | `--sound` | off | Play a short click on every collision. Volume scales with impact force -- light taps are quiet, hard hits are loud. |
+| `--goal` | off | Add a goal opening in the top wall. Glyphs that pass through disappear (cha-ching!) and after a random 1-4 second delay, a new random glyph enters through the goal at the same speed (reflected). Glyphs can bounce off the wall next to the goal and deflect in. |
+| `--goal-width N` | `150` | Width of the goal opening in pixels. |
 | `--debug` | off | Draw convex-hull wireframes (yellow) and centroid crosses (red) over each glyph. Useful for seeing exactly what the physics engine "sees". |
 | `--seed N` | random | RNG seed for reproducible runs. Same seed = same initial positions, velocities, characters, and colours. |
 
