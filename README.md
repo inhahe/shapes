@@ -7,6 +7,8 @@ bouncing off each other and the screen edges.
 
 All collision math -- impulse magnitudes, rotational velocity changes, friction
 -- is derived from each glyph's specific shape, not a bounding circle or box.
+Mass and inertia are computed from the true ink area (holes in letters like O,
+A, B are subtracted, nested fills are added back).
 
 ![demo concept](https://img.shields.io/badge/python-3.8%2B-blue)
 
@@ -25,7 +27,8 @@ python bouncing_glyphs.py
 ```
 
 Auto-detects a system font, spawns 15 white glyphs, perfectly elastic
-collisions, no gravity, no friction.
+collisions, no gravity, no friction.  Display syncs to your monitor refresh
+rate (vsync) when the driver supports it.
 
 ## Examples
 
@@ -38,6 +41,9 @@ python bouncing_glyphs.py --unicode --colorful --count 30
 
 # Realistic: friction slows sliding, gravity pulls down, slight energy loss
 python bouncing_glyphs.py --friction 0.3 --gravity 500 --restitution 0.9
+
+# DOS/BBS box-drawing characters with collision sounds
+python bouncing_glyphs.py --cp437 --sound --colorful --count 20
 
 # Huge glyphs, fast, orange, with debug hulls visible
 python bouncing_glyphs.py --font-size 120 --speed-max 600 --color "255,140,0" --debug
@@ -65,8 +71,11 @@ python bouncing_glyphs.py --chars "HELLO" --count 5 --font-size 100
 | `--friction MU` | `0.0` | Coulomb friction coefficient. `0` = frictionless (energy conserved perfectly). `0.3` = realistic sliding friction (collisions bleed tangential kinetic energy, glyphs gradually slow down and stop spinning). |
 | `--chars CHARS` | `A-Z a-z 0-9 &@#...` | Character pool to draw from. Each spawned glyph picks a random character from this string. |
 | `--unicode` | off | Pick from the font's entire Unicode character map instead of `--chars`. Gives you accented letters, symbols, Greek, Cyrillic -- whatever the font supports. |
+| `--ascii` | off | Use printable ASCII (codepoints 32-126). |
+| `--cp437` | off | Use CP437 (DOS/BBS) character set (codepoints 1-255). Includes box-drawing, block elements, card suits, accented letters, and other classic characters. |
 | `--colorful` | off | Each glyph gets a random saturated colour. Without this flag, all glyphs are the same colour. |
 | `--color C` | `white` | Base colour for all glyphs (when `--colorful` is not set). Accepts a pygame colour name (`red`, `cyan`, `gold`, ...) or `R,G,B` like `"255,100,0"`. |
+| `--sound` | off | Play a short click on every collision. Volume scales with impact force -- light taps are quiet, hard hits are loud. |
 | `--debug` | off | Draw convex-hull wireframes (yellow) and centroid crosses (red) over each glyph. Useful for seeing exactly what the physics engine "sees". |
 | `--seed N` | random | RNG seed for reproducible runs. Same seed = same initial positions, velocities, characters, and colours. |
 
@@ -78,22 +87,30 @@ python bouncing_glyphs.py --chars "HELLO" --count 5 --font-size 100
 | **Space** | Pause / resume |
 | **D** | Toggle debug overlay (convex hulls + centroids) |
 | **G** | Toggle gravity on/off (0 or 500 px/s^2) |
+| **S** | Toggle collision sound on/off (when `--sound` is available) |
 
 ## How the physics works
 
 Each glyph goes through this pipeline:
 
 1. **Outline extraction** -- fontTools reads the glyph's Bezier curves from the
-   font file and flattens them into a polyline.
+   font file, flattening them into polylines.  Individual contours are preserved
+   (outer boundaries and holes are kept separate).
 
 2. **Convex hull** -- Andrew's monotone-chain algorithm computes the tightest
-   convex polygon enclosing the outline.
+   convex polygon enclosing all contour points.  Used for collision detection
+   (SAT requires convex shapes).
 
-3. **Physical properties** -- from the hull polygon, computed exactly:
-   - **Area** and **centroid** via Green's theorem.
-   - **Mass** = density x area (bigger glyphs are heavier).
-   - **Moment of inertia** about the centroid, from the polygon's second moment
-     of area. A thin `I` has very different rotational inertia than a round `O`.
+3. **Physical properties** -- computed from the actual multi-contour outline,
+   not the hull:
+   - Each contour's **nesting depth** is determined (how many other contours
+     enclose it).  Even depth = filled, odd depth = hole.
+   - **Area** and **centroid** via Green's theorem, summed across contours with
+     corrected winding so holes subtract and nested fills add back.
+   - **Mass** = density x ink area (bigger glyphs are heavier; the hole in `O`
+     is not counted as mass).
+   - **Moment of inertia** about the centroid, from the second moment of area.
+     A thin `I` has very different rotational inertia than a round `O`.
 
 4. **Collision detection** -- every frame, each pair of glyphs is tested:
    - *Broad phase*: bounding-circle distance check (skip far-apart pairs).
@@ -123,3 +140,13 @@ Each glyph goes through this pipeline:
 
 7. **Wall collisions** -- same impulse math, treating each screen edge as a
    body with infinite mass. Off-centre wall hits impart spin.
+
+## Two kinds of "friction"
+
+The simulation has two independent parameters that both affect energy loss,
+often informally called "friction":
+
+| Parameter | What it controls | Physics term |
+|---|---|---|
+| `--restitution` | How much energy is lost on the **bounce** (normal direction). 1.0 = perfect bounce, 0.0 = stick. | Coefficient of restitution |
+| `--friction` | How much an object **slips** at the contact point (tangential direction). Affects spin transfer and tangential energy. 0.0 = ice, 0.3 = rubber. | Coulomb friction coefficient |
