@@ -142,31 +142,46 @@ def _flatten_curve(cur, args):
 #  Glyph-outline extraction  (via fontTools)
 # =====================================================================
 
-def _pen_to_points(ops, scale):
-    """RecordingPen operations -> list[(x, y)] in pixel coords, Y-down."""
-    pts = []
+def _pen_to_contours(ops, scale):
+    """RecordingPen operations -> list of contours, each a list of (x, y).
+
+    Preserves individual contours (outer boundaries and holes) so that
+    mass / inertia can be computed from the true ink area.
+    """
+    contours = []
+    cur_contour: list[tuple[float, float]] = []
     cur = (0.0, 0.0)
-    start = (0.0, 0.0)   # contour start (for None-endpoint handling)
+    start = (0.0, 0.0)
+
+    def _finish_contour():
+        if len(cur_contour) >= 3:
+            contours.append(cur_contour[:])
+        cur_contour.clear()
+
     for op, args in ops:
         if op == "moveTo":
+            _finish_contour()
             cur = start = args[0]
-            pts.append((cur[0] * scale, -cur[1] * scale))
+            cur_contour.append((cur[0] * scale, -cur[1] * scale))
         elif op == "lineTo":
             cur = args[0]
-            pts.append((cur[0] * scale, -cur[1] * scale))
+            cur_contour.append((cur[0] * scale, -cur[1] * scale))
         elif op == "qCurveTo":
             a = list(args)
             if a[-1] is None:
                 a[-1] = start
             for p in _flatten_qcurve(cur, a):
-                pts.append((p[0] * scale, -p[1] * scale))
+                cur_contour.append((p[0] * scale, -p[1] * scale))
             cur = a[-1]
         elif op == "curveTo":
             for p in _flatten_curve(cur, args):
-                pts.append((p[0] * scale, -p[1] * scale))
+                cur_contour.append((p[0] * scale, -p[1] * scale))
             cur = args[-1]
-        # closePath / endPath -- nothing to record
-    return pts
+        elif op in ("closePath", "endPath"):
+            _finish_contour()
+
+    _finish_contour()   # in case the last contour had no explicit close
+    return contours
 
 
 def load_outlines(font_path: str, chars: str | None, size: int) -> dict[str, list]:
@@ -175,9 +190,11 @@ def load_outlines(font_path: str, chars: str | None, size: int) -> dict[str, lis
     *chars*: a string of characters to extract, or ``None`` to scan the
     font's entire cmap (all Unicode codepoints the font supports).
 
-    Returns ``{char: [(x, y), ...]}`` in pixel coordinates (Y-down),
-    scaled to *size* pixels-per-em.  Characters whose outlines are
-    missing or degenerate (< 3 points) are silently skipped.
+    Returns ``{char: [contour, ...]}`` where each contour is a list of
+    ``(x, y)`` tuples in pixel coordinates (Y-down), scaled to *size*
+    pixels-per-em.  Separate contours are preserved so that mass and
+    inertia can be computed from the true ink area (holes subtracted).
+    Characters with no usable contours are silently skipped.
     """
     kw = {}
     if font_path.lower().endswith((".ttc", ".otc")):
@@ -213,9 +230,9 @@ def load_outlines(font_path: str, chars: str | None, size: int) -> dict[str, lis
             gs[name].draw(pen)
         except Exception:
             continue
-        pts = _pen_to_points(pen.value, sc)
-        if len(pts) >= 3:
-            out[ch] = pts
+        contours = _pen_to_contours(pen.value, sc)
+        if contours:
+            out[ch] = contours
     tt.close()
     return out
 
@@ -294,6 +311,122 @@ def polygon_props(verts):
 
     mass = DENSITY * area
     # Polar moment of inertia = Ixx + Iyy, scaled by density
+    inertia = DENSITY * abs(Ixx + Iyy)
+    return area, (cx, cy), max(inertia, 0.01), mass
+
+
+def _signed_area_of(contour):
+    """Signed area of a single closed contour (shoelace formula)."""
+    sa = 0.0
+    n = len(contour)
+    for i in range(n):
+        j = (i + 1) % n
+        sa += contour[i][0] * contour[j][1] - contour[j][0] * contour[i][1]
+    return sa * 0.5
+
+
+def _point_in_polygon(px, py, polygon):
+    """Ray-casting point-in-polygon test."""
+    inside = False
+    n = len(polygon)
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > py) != (yj > py)) and \
+           (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _contour_nesting(contours):
+    """Return the nesting depth of each contour (0 = outermost).
+
+    Depth is the number of other contours that contain a sample point
+    of this contour.  Even depth = filled region, odd depth = hole.
+    """
+    nc = len(contours)
+    depths = [0] * nc
+    for i in range(nc):
+        pt = contours[i][0]
+        for j in range(nc):
+            if i != j and _point_in_polygon(pt[0], pt[1], contours[j]):
+                depths[i] += 1
+    return depths
+
+
+def multi_contour_props(contours):
+    """Physical properties for a glyph with arbitrarily nested contours.
+
+    Determines each contour's nesting depth (how many other contours
+    enclose it) and corrects its winding so that even-depth contours
+    (filled regions) add material and odd-depth contours (holes)
+    subtract it.  This handles all cases correctly:
+
+    - Simple outlines (``I``, ``l``): depth 0, adds material.
+    - Letters with holes (``O``, ``A``, ``B``): outer at depth 0,
+      hole at depth 1 — hole subtracts.
+    - Nested fills (bullseye, ``@``): solid inside a hole at depth 2
+      — adds material back.
+
+    Returns ``(area, (cx, cy), moment_of_inertia, mass)``.
+    """
+    if not contours:
+        return 1.0, (0.0, 0.0), 1.0, DENSITY
+
+    # ── Determine correction factor for each contour ──
+    depths = _contour_nesting(contours)
+    flips = []
+    for k, contour in enumerate(contours):
+        sa = _signed_area_of(contour)
+        # Even depth = filled (want positive contribution)
+        # Odd depth  = hole   (want negative contribution)
+        want_positive = (depths[k] % 2 == 0)
+        is_positive = (sa > 0)
+        flips.append(1 if want_positive == is_positive else -1)
+
+    # ── Accumulate Green's theorem sums with corrected winding ──
+    total_sa = cx_num = cy_num = 0.0
+    for k, contour in enumerate(contours):
+        f = flips[k]
+        n = len(contour)
+        for i in range(n):
+            j = (i + 1) % n
+            d = (contour[i][0] * contour[j][1]
+                 - contour[j][0] * contour[i][1]) * f
+            total_sa += d
+            cx_num += (contour[i][0] + contour[j][0]) * d
+            cy_num += (contour[i][1] + contour[j][1]) * d
+
+    total_sa *= 0.5
+    area = abs(total_sa)
+    if area < 1e-8:
+        all_pts = [p for c in contours for p in c]
+        nn = max(len(all_pts), 1)
+        cx = sum(p[0] for p in all_pts) / nn
+        cy = sum(p[1] for p in all_pts) / nn
+        return max(area, 1.0), (cx, cy), 1.0, max(DENSITY * area, 0.01)
+
+    cx = cx_num / (6.0 * total_sa)
+    cy = cy_num / (6.0 * total_sa)
+
+    # ── Second moments of area about the centroid ──
+    Ixx = Iyy = 0.0
+    for k, contour in enumerate(contours):
+        f = flips[k]
+        n = len(contour)
+        for i in range(n):
+            j = (i + 1) % n
+            xi, yi = contour[i][0] - cx, contour[i][1] - cy
+            xj, yj = contour[j][0] - cx, contour[j][1] - cy
+            d = (xi * yj - xj * yi) * f
+            Ixx += d * (yi * yi + yi * yj + yj * yj)
+            Iyy += d * (xi * xi + xi * xj + xj * xj)
+    Ixx /= 12.0
+    Iyy /= 12.0
+
+    mass = DENSITY * area
     inertia = DENSITY * abs(Ixx + Iyy)
     return area, (cx, cy), max(inertia, 0.01), mass
 
@@ -592,12 +725,19 @@ def _bright_color():
     return (int(r * 255), int(g * 255), int(b * 255))
 
 
-def make_body(ch, outline, pg_font, pos, vel, restitution, color):
-    """Build a Body: convex hull, physical properties, centred surface."""
-    hull = convex_hull(outline)
+def make_body(ch, contours, pg_font, pos, vel, restitution, color):
+    """Build a Body from glyph contours.
+
+    *contours* is a list of contour polylines (as returned by
+    ``load_outlines``).  Mass and inertia are computed from the true ink
+    area (holes subtracted).  The convex hull of all points is used for
+    collision detection.
+    """
+    all_pts = [p for c in contours for p in c]
+    hull = convex_hull(all_pts)
     if len(hull) < 3:
         return None
-    area, (cx, cy), inertia, mass = polygon_props(hull)
+    area, (cx, cy), inertia, mass = multi_contour_props(contours)
     # Hull vertices in local (centroid-relative) coordinates
     local = [(x - cx, y - cy) for x, y in hull]
 
