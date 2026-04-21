@@ -1160,8 +1160,11 @@ def main():
                           if gl < b.px < gr and b.py < 0]
                 for i in reversed(exited):
                     b = bodies.pop(i)
+                    # Store velocity, omega, AND mass/inertia so we can
+                    # conserve kinetic energy when the new glyph differs.
                     respawn_queue.append([random.uniform(1.0, 4.0),
-                                         b.vx, b.vy, b.omega])
+                                         b.vx, b.vy, b.omega,
+                                         b.mass, b.inertia])
                     goal_score += 1
                     if goal_exit_sound:
                         goal_exit_sound.play()
@@ -1172,18 +1175,25 @@ def main():
                     entry[0] -= dt
                     if entry[0] <= 0:
                         respawn_queue.remove(entry)
-                        _, evx, evy, eomega = entry
+                        _, evx, evy, eomega, emass, einertia = entry
                         ch = random.choice(usable)
-                        # Enter at the goal opening, velocity reflected off wall
                         gx = random.uniform(goal[0] + 20, goal[1] - 20)
                         color = _bright_color() if args.colorful else base_color
-                        nb = make_body(ch, outlines[ch], pg_font,
-                                       (gx, args.font_size * 0.6),
-                                       (evx, abs(evy) if evy < 0 else evy),
-                                       args.restitution, color)
-                        if nb is not None:
-                            nb.omega = -eomega
-                            bodies.append(nb)
+                        newb = make_body(ch, outlines[ch], pg_font,
+                                         (gx, args.font_size * 0.6),
+                                         (0, 0),   # placeholder, set below
+                                         args.restitution, color)
+                        if newb is not None:
+                            # Scale velocity to conserve kinetic energy:
+                            #   0.5*m_old*v_old^2 = 0.5*m_new*v_new^2
+                            #   v_new = v_old * sqrt(m_old / m_new)
+                            vs = math.sqrt(emass / newb.mass)
+                            ws = math.sqrt(einertia / newb.inertia)
+                            vy_in = abs(evy) if evy < 0 else evy
+                            newb.vx = evx * vs
+                            newb.vy = vy_in * vs
+                            newb.omega = -eomega * ws
+                            bodies.append(newb)
                             if goal_enter_sound:
                                 goal_enter_sound.play()
 
