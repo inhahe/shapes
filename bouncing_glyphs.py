@@ -25,11 +25,13 @@ Interactive keys:
     SPACE               --  pause / resume
     D                   --  toggle convex-hull debug overlay
     G                   --  toggle gravity (0 <-> 500 px/s^2)
+    S                   --  toggle collision sound (when --sound is available)
 """
 
 from __future__ import annotations
 
 import argparse
+import array
 import math
 import os
 import random
@@ -572,12 +574,15 @@ def _velocity_at(body, r):
 
 
 def resolve_pair(a, b, n, depth, cp):
-    """Full impulse-based collision response between two Bodies."""
+    """Full impulse-based collision response between two Bodies.
 
+    Returns the normal impulse magnitude *j* (>= 0), or 0 if no
+    impulse was applied (e.g. bodies already separating).
+    """
     # --- Positional correction  (Baumgarte stabilisation) ---
     total_inv = a.inv_mass + b.inv_mass
     if total_inv < 1e-12:
-        return
+        return 0.0
     slop = 0.5                # allow tiny overlap to reduce jitter
     percent = 0.6             # correction strength
     correction = max(depth - slop, 0.0) / total_inv * percent
@@ -594,7 +599,7 @@ def resolve_pair(a, b, n, depth, cp):
     vn = dot2(v_rel, n)
     # n points A->B, v_rel = vA-vB, so vn > 0 means approaching.
     if vn < 0:     # already separating
-        return
+        return 0.0
 
     e = min(a.restitution, b.restitution)
     rn_a = cross2(ra, n)
@@ -603,7 +608,7 @@ def resolve_pair(a, b, n, depth, cp):
              + rn_a * rn_a * a.inv_inertia
              + rn_b * rn_b * b.inv_inertia)
     if abs(denom) < 1e-12:
-        return
+        return 0.0
     j = (1.0 + e) * vn / denom          # positive impulse magnitude
     J = vscale(n, -j)                    # A gets pushed in -n (away from B)
     _apply(a, J, ra)
@@ -614,7 +619,7 @@ def resolve_pair(a, b, n, depth, cp):
     vt_vec = vsub(v_rel, vscale(n, dot2(v_rel, n)))
     vt_len = vlength(vt_vec)
     if vt_len < 1e-8:
-        return
+        return j
     tangent = vscale(vt_vec, -1.0 / vt_len)
     rt_a = cross2(ra, tangent)
     rt_b = cross2(rb, tangent)
@@ -622,12 +627,13 @@ def resolve_pair(a, b, n, depth, cp):
                + rt_a * rt_a * a.inv_inertia
                + rt_b * rt_b * b.inv_inertia)
     if abs(f_denom) < 1e-12:
-        return
+        return j
     jt = vt_len / f_denom
     jt = min(jt, j * MU_FRICTION)        # Coulomb clamp
     Jt = vscale(tangent, jt)
     _apply(a, Jt, ra)
     _apply(b, vscale(Jt, -1), rb)
+    return j
 
 
 # =====================================================================
@@ -635,7 +641,10 @@ def resolve_pair(a, b, n, depth, cp):
 # =====================================================================
 
 def _resolve_wall(body, cp, n, depth):
-    """Impulse response against an immovable wall (infinite mass, I=inf)."""
+    """Impulse response against an immovable wall (infinite mass, I=inf).
+
+    Returns the normal impulse magnitude *j*, or 0.
+    """
     body.px += n[0] * depth
     body.py += n[1] * depth
 
@@ -643,13 +652,13 @@ def _resolve_wall(body, cp, n, depth):
     vc = _velocity_at(body, r)
     vn = dot2(vc, n)
     if vn >= 0:
-        return
+        return 0.0
 
     e = body.restitution
     rn = cross2(r, n)
     denom = body.inv_mass + rn * rn * body.inv_inertia
     if abs(denom) < 1e-12:
-        return
+        return 0.0
     j = -(1.0 + e) * vn / denom
     _apply(body, vscale(n, j), r)
 
@@ -658,19 +667,25 @@ def _resolve_wall(body, cp, n, depth):
     vt_vec = vsub(vc, vscale(n, dot2(vc, n)))
     vt_len = vlength(vt_vec)
     if vt_len < 1e-8:
-        return
+        return j
     tangent = vscale(vt_vec, -1.0 / vt_len)
     rt = cross2(r, tangent)
     fd = body.inv_mass + rt * rt * body.inv_inertia
     if abs(fd) < 1e-12:
-        return
+        return j
     jt = min(vt_len / fd, j * MU_FRICTION)
     _apply(body, vscale(tangent, jt), r)
+    return j
 
 
 def handle_walls(body, W, H):
-    """Detect and resolve wall penetration (deepest vertex per wall)."""
+    """Detect and resolve wall penetration (deepest vertex per wall).
+
+    Returns the largest wall impulse magnitude this frame (for sound).
+    """
     verts = body.world_verts()
+    max_j = 0.0
+
     # Left wall  (normal = +x)
     worst, cp = 0.0, None
     for v in verts:
@@ -678,7 +693,7 @@ def handle_walls(body, W, H):
         if d > worst:
             worst, cp = d, v
     if cp:
-        _resolve_wall(body, cp, (1.0, 0.0), worst)
+        max_j = max(max_j, _resolve_wall(body, cp, (1.0, 0.0), worst))
 
     # Right wall  (normal = -x)
     worst, cp = 0.0, None
@@ -687,7 +702,7 @@ def handle_walls(body, W, H):
         if d > worst:
             worst, cp = d, v
     if cp:
-        _resolve_wall(body, cp, (-1.0, 0.0), worst)
+        max_j = max(max_j, _resolve_wall(body, cp, (-1.0, 0.0), worst))
 
     # Top wall  (normal = +y)
     worst, cp = 0.0, None
@@ -696,7 +711,7 @@ def handle_walls(body, W, H):
         if d > worst:
             worst, cp = d, v
     if cp:
-        _resolve_wall(body, cp, (0.0, 1.0), worst)
+        max_j = max(max_j, _resolve_wall(body, cp, (0.0, 1.0), worst))
 
     # Bottom wall  (normal = -y)
     worst, cp = 0.0, None
@@ -705,7 +720,9 @@ def handle_walls(body, W, H):
         if d > worst:
             worst, cp = d, v
     if cp:
-        _resolve_wall(body, cp, (0.0, -1.0), worst)
+        max_j = max(max_j, _resolve_wall(body, cp, (0.0, -1.0), worst))
+
+    return max_j
 
 
 # =====================================================================
@@ -827,10 +844,16 @@ def main():
                     help="Character pool to draw from")
     ap.add_argument("--unicode",     action="store_true",
                     help="Pick from the font's entire Unicode range instead of --chars")
+    ap.add_argument("--ascii",       action="store_true",
+                    help="Use printable ASCII (codepoints 32-126)")
+    ap.add_argument("--cp437",       action="store_true",
+                    help="Use CP437 (DOS/BBS) character set (codepoints 1-255)")
     ap.add_argument("--colorful",    action="store_true",
                     help="Random colour per glyph (default: all white)")
     ap.add_argument("--color",       default="white", type=str,
                     help="Glyph colour name or R,G,B (default: white)")
+    ap.add_argument("--sound",       action="store_true",
+                    help="Play a click on every collision (volume ~ impact force)")
     ap.add_argument("--debug",       action="store_true",
                     help="Draw convex-hull wireframes")
     ap.add_argument("--seed",        default=None, type=int,
@@ -844,10 +867,34 @@ def main():
     global MU_FRICTION
     MU_FRICTION = args.friction
 
-    # ---- Initialise pygame ----
+    # ---- Initialise pygame (with vsync) ----
     pygame.init()
-    screen = pygame.display.set_mode((args.width, args.height))
+    use_vsync = False
+    try:
+        screen = pygame.display.set_mode((args.width, args.height), vsync=1)
+        use_vsync = True
+    except Exception:
+        screen = pygame.display.set_mode((args.width, args.height))
     clock = pygame.time.Clock()
+
+    # ---- Sound ----
+    click_sound = None
+    if args.sound:
+        try:
+            pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+            # Generate a short damped click (~12 ms)
+            _sr = 44100
+            _dur = 0.012
+            _ns = int(_sr * _dur)
+            _buf = array.array("h", (
+                int(8000 * math.exp(-i / _sr * 500) *
+                    math.sin(2 * math.pi * 900 * i / _sr))
+                for i in range(_ns)
+            ))
+            click_sound = pygame.mixer.Sound(buffer=_buf)
+            pygame.mixer.set_num_channels(16)
+        except Exception as exc:
+            print(f"Sound init failed ({exc}); continuing without sound.")
 
     # ---- Load font ----
     font_path = args.font or _find_font()
@@ -857,8 +904,15 @@ def main():
     pygame.display.set_caption(f"Bouncing Glyphs  [{font_name}]")
     print(f"Font : {font_path}")
 
-    # ---- Extract glyph outlines (fontTools) ----
-    char_source = None if args.unicode else args.chars
+    # ---- Character set selection ----
+    if args.unicode:
+        char_source = None  # scan entire cmap
+    elif args.cp437:
+        char_source = bytes(range(1, 256)).decode("cp437")
+    elif args.ascii:
+        char_source = "".join(chr(c) for c in range(32, 127))
+    else:
+        char_source = args.chars
     outlines = load_outlines(font_path, char_source, args.font_size)
     if not outlines:
         sys.exit("Error: could not extract any glyph outlines from this font.")
@@ -906,7 +960,10 @@ def main():
             b.omega = random.uniform(-3.0, 3.0)
             bodies.append(b)
     print(f"Bodies spawned   : {len(bodies)}")
-    print("Controls: ESC=quit  SPACE=pause  D=debug  G=gravity toggle")
+    vsync_str = "vsync" if use_vsync else "60fps"
+    sound_str = "  S=sound toggle" if click_sound else ""
+    print(f"Display          : {args.width}x{args.height} {vsync_str}")
+    print(f"Controls: ESC=quit  SPACE=pause  D=debug  G=gravity{sound_str}")
 
     # ---- HUD font ----
     try:
@@ -921,7 +978,12 @@ def main():
     gravity = args.gravity
 
     while running:
-        dt = min(clock.tick(60) / 1000.0, 1.0 / 30.0)   # cap large steps
+        # vsync: flip() already blocked, just measure dt.
+        # no vsync: cap at 60 fps via clock.tick.
+        if use_vsync:
+            dt = min(clock.tick() / 1000.0, 1.0 / 30.0)
+        else:
+            dt = min(clock.tick(60) / 1000.0, 1.0 / 30.0)
 
         # ---- Events ----
         for ev in pygame.event.get():
@@ -936,6 +998,9 @@ def main():
                     debug = not debug
                 elif ev.key == pygame.K_g:
                     gravity = 0.0 if gravity else 500.0
+                elif ev.key == pygame.K_s:
+                    if click_sound:
+                        args.sound = not args.sound
 
         if paused:
             # Still draw, but skip physics
@@ -952,6 +1017,7 @@ def main():
             # ---- Body-body collisions ----
             #   Broad phase: bounding-circle distance check
             #   Narrow phase: SAT on rotated convex hulls
+            frame_max_j = 0.0
             nb = len(bodies)
             wv = [b.world_verts() for b in bodies]   # cache world verts
             for i in range(nb):
@@ -964,11 +1030,21 @@ def main():
                     hit, n, d = sat_test(wv[i], wv[j])
                     if hit:
                         cp = _contact_pt(wv[i], wv[j], n)
-                        resolve_pair(a, bb, n, d, cp)
+                        imp = resolve_pair(a, bb, n, d, cp)
+                        if imp > 0 and click_sound and args.sound:
+                            vol = min(1.0, max(0.05, math.log1p(imp) / 7.0))
+                            click_sound.set_volume(vol)
+                            click_sound.play()
+                        frame_max_j = max(frame_max_j, imp)
 
             # ---- Wall collisions (fresh verts after body-body resolution) ----
             for b in bodies:
-                handle_walls(b, args.width, args.height)
+                wj = handle_walls(b, args.width, args.height)
+                if wj > 0 and click_sound and args.sound:
+                    vol = min(1.0, max(0.05, math.log1p(wj) / 7.0))
+                    click_sound.set_volume(vol)
+                    click_sound.play()
+                frame_max_j = max(frame_max_j, wj)
 
         # ---- Render ----
         screen.fill((12, 12, 20))
