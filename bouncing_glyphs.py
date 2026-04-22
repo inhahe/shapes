@@ -19,7 +19,6 @@ Usage:
     python bouncing_glyphs.py --unicode --colorful --count 30
     python bouncing_glyphs.py --friction 0.3 --gravity 500    (realistic friction + gravity)
     python bouncing_glyphs.py --goal --sound --gravity 400    (goal mode with sounds)
-    python bouncing_glyphs.py --physics-rate 480 --speed-max 800  (high-speed, tight substeps)
     python bouncing_glyphs.py --color "255,100,0" --font-size 100 --debug
 
 Interactive keys:
@@ -938,9 +937,6 @@ def main():
                     help="Width of the goal opening in pixels (default: 150)")
     ap.add_argument("--debug",       action="store_true",
                     help="Draw convex-hull wireframes")
-    ap.add_argument("--physics-rate", default=240,  type=int,
-                    help="Physics sub-step rate in Hz (default: 240). Higher "
-                         "values improve collision accuracy for fast objects.")
     ap.add_argument("--seed",        default=None, type=int,
                     help="RNG seed for reproducible runs")
     args = ap.parse_args()
@@ -1089,8 +1085,7 @@ def main():
     vsync_str = "vsync" if use_vsync else "60fps"
     sound_str = "  S=sound toggle" if click_sound else ""
     print(f"Display          : {args.width}x{args.height} {vsync_str}")
-    print(f"Physics          : {args.physics_rate} Hz "
-          f"(~{max(1, round(args.physics_rate / 60))} substeps/frame at 60 fps)")
+    print(f"Physics          : continuous (variable dt, as fast as CPU allows)")
     print(f"Controls: ESC=quit  SPACE=pause  D=debug  G=gravity  LMB=drag{sound_str}")
 
     # ---- HUD font ----
@@ -1113,9 +1108,9 @@ def main():
     drag_vel_x = 0.0
     drag_vel_y = 0.0
 
-    # ---- Physics substep setup ----
-    PHYS_DT = 1.0 / args.physics_rate
-    phys_accum = 0.0
+    # ---- Physics timing ----
+    last_phys = time.perf_counter()
+    render_cost = 0.003           # rolling estimate of render+flip time (seed 3 ms)
 
     def _physics_step(sdt):
         """One fixed-timestep physics substep."""
@@ -1293,32 +1288,30 @@ def main():
                 dragged_body.omega = 0.0
 
         if paused:
-            # Still draw, but skip physics
-            pass
+            # Still draw, but skip physics.  Reset the physics clock so
+            # unpause doesn't see a huge dt from the entire pause.
+            last_phys = time.perf_counter()
         else:
-            # Fixed-timestep substep loop: accumulate wall-clock time and
-            # drain it in fixed PHYS_DT bites.  Runs as many substeps as
-            # the CPU can fit before the frame-time budget runs out.  If
-            # physics can't keep up (spiral of death), the leftover
-            # accumulator is clamped so the simulation slows down
-            # gracefully instead of freezing.
-            phys_accum += dt
-            # Use up to 80% of frame time for physics, leave 20% for
-            # rendering + event handling.  No fixed step cap.
-            frame_deadline = time.perf_counter() + dt * 0.8
-            substeps = 0
-            while phys_accum >= PHYS_DT:
-                if substeps >= 4 and time.perf_counter() >= frame_deadline:
-                    break          # out of time -- render what we have
-                phys_accum -= PHYS_DT
-                _physics_step(PHYS_DT)
-                substeps += 1
-            # If we broke out early, clamp the accumulator so we don't
-            # build up a debt that can never be repaid.
-            if phys_accum > PHYS_DT * 4:
-                phys_accum = 0.0
+            # Continuous variable-dt physics: run as many steps as the
+            # CPU can fit before it's time to render.  Each step uses
+            # the real nanosecond-precision elapsed time since the last
+            # step.  The first step each frame naturally absorbs the
+            # render/flip gap from the previous frame, so sim-time
+            # stays synchronised with wall-clock time -- no accumulator,
+            # no fixed rate, no budget.
+            #
+            # We reserve just enough time for rendering (measured from
+            # the previous frame) and give everything else to physics.
+            phys_deadline = time.perf_counter() + dt - render_cost * 1.2
+            while time.perf_counter() < phys_deadline:
+                now = time.perf_counter()
+                sdt = now - last_phys
+                last_phys = now
+                if sdt > 1e-7:
+                    _physics_step(sdt)
 
-        # ---- Render ----
+        # ---- Render (timed so physics knows how much room to leave) ----
+        render_t0 = time.perf_counter()
         screen.fill((12, 12, 20))
 
         for b in bodies:
@@ -1383,6 +1376,7 @@ def main():
                 else pygame.SYSTEM_CURSOR_ARROW)
 
         pygame.display.flip()
+        render_cost = render_cost * 0.9 + (time.perf_counter() - render_t0) * 0.1
 
     pygame.quit()
 
