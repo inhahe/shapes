@@ -81,6 +81,7 @@ python bouncing_glyphs.py --chars "HELLO" --count 5 --font-size 100
 | `--sound` | off | Play a short click on every collision. Volume scales with impact force -- light taps are quiet, hard hits are loud. |
 | `--goal` | off | Add a goal opening in the top wall. Glyphs that pass through disappear (cha-ching!) and after a random 1-4 second delay, a new random glyph enters through the goal at the same speed (reflected). Glyphs can bounce off the wall next to the goal and deflect in. |
 | `--goal-width N` | `150` | Width of the goal opening in pixels. |
+| `--physics-rate N` | `240` | Physics sub-step rate in Hz. The engine runs as many fixed-size sub-steps as the CPU can fit in each frame (time-budgeted, no hard cap). At 240 Hz / 60 fps that's ~4 minimum; at 1000 Hz it could be 15-30+. Higher values improve collision accuracy for fast/tiny objects. |
 | `--debug` | off | Draw convex-hull wireframes (yellow) and centroid crosses (red) over each glyph. Useful for seeing exactly what the physics engine "sees". |
 | `--seed N` | random | RNG seed for reproducible runs. Same seed = same initial positions, velocities, characters, and colours. |
 
@@ -129,11 +130,20 @@ Each glyph goes through this pipeline:
    - **Moment of inertia** about the centroid, from the second moment of area.
      A thin `I` has very different rotational inertia than a round `O`.
 
-4. **Collision detection** -- every frame, each pair of glyphs is tested:
+4. **Fixed-timestep sub-stepping** -- physics is decoupled from the display
+   refresh rate.  Wall-clock time is accumulated and drained in fixed-size
+   bites (`1 / --physics-rate` seconds each, default 1/240 s).  There is no
+   hard cap on sub-steps per frame -- the engine runs as many as the CPU can
+   fit within 80% of the frame-time budget (a minimum of 4 are always run).
+   If physics falls behind, the accumulator is clamped so the simulation
+   slows down gracefully instead of freezing.  Baumgarte positional-correction
+   parameters are scaled by `dt` so collision response is stable at any rate.
+
+5. **Collision detection** -- every sub-step, each pair of glyphs is tested:
    - *Broad phase*: bounding-circle distance check (skip far-apart pairs).
    - *Narrow phase*: Separating Axis Theorem on the rotated convex hulls.
 
-5. **Collision response** -- impulse-based rigid-body physics:
+6. **Collision response** -- impulse-based rigid-body physics:
    ```
    j = (1+e) * v_n / (1/m_a + 1/m_b + (r_a x n)^2/I_a + (r_b x n)^2/I_b)
    ```
@@ -147,7 +157,7 @@ Each glyph goes through this pipeline:
    hit makes the glyph spin. A glancing hit transfers energy between translation
    and rotation.
 
-6. **Friction** -- Coulomb model applied tangentially at the contact point:
+7. **Friction** -- Coulomb model applied tangentially at the contact point:
    - Opposes sliding at the contact.
    - Clamped to `mu * j_normal` (the friction cone).
    - With `--friction 0` (default): perfectly frictionless, energy is conserved
@@ -155,7 +165,7 @@ Each glyph goes through this pipeline:
    - With `--friction 0.3`: realistic surface friction. Glyphs gradually lose
      kinetic energy and stop spinning.
 
-7. **Wall collisions** -- same impulse math, treating each screen edge as a
+8. **Wall collisions** -- same impulse math, treating each screen edge as a
    body with infinite mass. Off-centre wall hits impart spin.
 
 ## Two kinds of "friction"

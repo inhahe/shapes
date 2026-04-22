@@ -19,6 +19,7 @@ Usage:
     python bouncing_glyphs.py --unicode --colorful --count 30
     python bouncing_glyphs.py --friction 0.3 --gravity 500    (realistic friction + gravity)
     python bouncing_glyphs.py --goal --sound --gravity 400    (goal mode with sounds)
+    python bouncing_glyphs.py --physics-rate 480 --speed-max 800  (high-speed, tight substeps)
     python bouncing_glyphs.py --color "255,100,0" --font-size 100 --debug
 
 Interactive keys:
@@ -40,6 +41,7 @@ import math
 import os
 import random
 import sys
+import time
 
 import pygame
 import pygame.freetype
@@ -577,18 +579,30 @@ def _velocity_at(body, r):
             body.vy + body.omega * r[0])
 
 
-def resolve_pair(a, b, n, depth, cp):
+_BAUMGARTE_REF_DT = 1.0 / 60.0   # reference dt the constants were tuned for
+_BAUMGARTE_SLOP   = 0.5          # overlap tolerance at reference dt
+_BAUMGARTE_PERCENT = 0.6         # correction strength at reference dt
+
+
+def resolve_pair(a, b, n, depth, cp, sdt=_BAUMGARTE_REF_DT):
     """Full impulse-based collision response between two Bodies.
+
+    *sdt* is the substep duration, used to scale the Baumgarte positional
+    correction so it behaves identically at any physics rate.
 
     Returns the normal impulse magnitude *j* (>= 0), or 0 if no
     impulse was applied (e.g. bodies already separating).
     """
     # --- Positional correction  (Baumgarte stabilisation) ---
+    #     Scale slop and percent proportionally to dt so that the
+    #     correction converges at the same real-time rate regardless
+    #     of how many substeps we run.
     total_inv = a.inv_mass + b.inv_mass
     if total_inv < 1e-12:
         return 0.0
-    slop = 0.5                # allow tiny overlap to reduce jitter
-    percent = 0.6             # correction strength
+    dt_ratio = sdt / _BAUMGARTE_REF_DT
+    slop = _BAUMGARTE_SLOP * dt_ratio
+    percent = 1.0 - (1.0 - _BAUMGARTE_PERCENT) ** dt_ratio
     correction = max(depth - slop, 0.0) / total_inv * percent
     a.px -= n[0] * correction * a.inv_mass
     a.py -= n[1] * correction * a.inv_mass
@@ -924,6 +938,9 @@ def main():
                     help="Width of the goal opening in pixels (default: 150)")
     ap.add_argument("--debug",       action="store_true",
                     help="Draw convex-hull wireframes")
+    ap.add_argument("--physics-rate", default=240,  type=int,
+                    help="Physics sub-step rate in Hz (default: 240). Higher "
+                         "values improve collision accuracy for fast objects.")
     ap.add_argument("--seed",        default=None, type=int,
                     help="RNG seed for reproducible runs")
     args = ap.parse_args()
@@ -1072,6 +1089,8 @@ def main():
     vsync_str = "vsync" if use_vsync else "60fps"
     sound_str = "  S=sound toggle" if click_sound else ""
     print(f"Display          : {args.width}x{args.height} {vsync_str}")
+    print(f"Physics          : {args.physics_rate} Hz "
+          f"(~{max(1, round(args.physics_rate / 60))} substeps/frame at 60 fps)")
     print(f"Controls: ESC=quit  SPACE=pause  D=debug  G=gravity  LMB=drag{sound_str}")
 
     # ---- HUD font ----
@@ -1093,6 +1112,94 @@ def main():
     drag_offset_y = 0.0
     drag_vel_x = 0.0
     drag_vel_y = 0.0
+
+    # ---- Physics substep setup ----
+    PHYS_DT = 1.0 / args.physics_rate
+    phys_accum = 0.0
+
+    def _physics_step(sdt):
+        """One fixed-timestep physics substep."""
+        nonlocal goal_score
+
+        # ---- Integrate ----
+        TAU = math.tau
+        for b in bodies:
+            if b is dragged_body:
+                continue
+            b.vy += gravity * sdt
+            b.px += b.vx * sdt
+            b.py += b.vy * sdt
+            b.angle = (b.angle + b.omega * sdt) % TAU
+
+        # ---- Body-body collisions ----
+        #   Broad phase: bounding-circle distance check
+        #   Narrow phase: SAT on rotated convex hulls
+        nb = len(bodies)
+        wv = [b.world_verts() for b in bodies]
+        for i in range(nb):
+            a = bodies[i]
+            for j in range(i + 1, nb):
+                bb = bodies[j]
+                rr = a.radius + bb.radius
+                if vdist2((a.px, a.py), (bb.px, bb.py)) > rr * rr:
+                    continue
+                hit, n, d = sat_test(wv[i], wv[j])
+                if hit:
+                    cp = _contact_pt(wv[i], wv[j], n)
+                    imp = resolve_pair(a, bb, n, d, cp, sdt)
+                    if imp > 0 and click_sound and args.sound:
+                        vol = min(1.0, max(0.05, math.log1p(imp) / 7.0))
+                        click_sound.set_volume(vol)
+                        click_sound.play()
+
+        # ---- Wall collisions (fresh verts after body-body resolution) ----
+        for b in bodies:
+            if b is dragged_body:
+                continue
+            wj = handle_walls(b, args.width, args.height, goal)
+            if wj > 0 and click_sound and args.sound:
+                vol = min(1.0, max(0.05, math.log1p(wj) / 7.0))
+                click_sound.set_volume(vol)
+                click_sound.play()
+
+        # ---- Goal: exit detection ----
+        if goal:
+            gl, gr = goal
+            exited = [i for i, b in enumerate(bodies)
+                      if b is not dragged_body and gl < b.px < gr and b.py < 0]
+            for i in reversed(exited):
+                b = bodies.pop(i)
+                respawn_queue.append([random.uniform(1.0, 4.0),
+                                     b.vx, b.vy, b.omega,
+                                     b.mass, b.inertia])
+                goal_score += 1
+                if goal_exit_sound:
+                    goal_exit_sound.play()
+
+        # ---- Goal: respawn queue ----
+        if respawn_queue:
+            for entry in respawn_queue[:]:
+                entry[0] -= sdt
+                if entry[0] <= 0:
+                    respawn_queue.remove(entry)
+                    _, evx, evy, eomega, emass, einertia = entry
+                    ch = random.choice(usable)
+                    gx = random.uniform(goal[0] + 20, goal[1] - 20)
+                    color = _bright_color() if args.colorful else base_color
+                    newb = make_body(ch, outlines[ch], pg_font,
+                                     (gx, args.font_size * 0.6),
+                                     (0, 0),
+                                     args.restitution, color)
+                    if newb is not None:
+                        vs = math.sqrt(emass / newb.mass)
+                        ws = math.sqrt(einertia / newb.inertia)
+                        vy_in = abs(evy) if evy < 0 else evy
+                        newb.vx = evx * vs
+                        newb.vy = vy_in * vs
+                        newb.omega = -eomega * ws
+                        bodies.append(newb)
+                        if goal_enter_sound:
+                            goal_enter_sound.play()
 
     while running:
         # vsync: flip() already blocked, just measure dt.
@@ -1189,93 +1296,27 @@ def main():
             # Still draw, but skip physics
             pass
         else:
-            # ---- Integrate ----
-            TAU = math.tau
-            for b in bodies:
-                if b is dragged_body:
-                    continue
-                b.vy += gravity * dt
-                b.px += b.vx * dt
-                b.py += b.vy * dt
-                b.angle = (b.angle + b.omega * dt) % TAU
-
-            # ---- Body-body collisions ----
-            #   Broad phase: bounding-circle distance check
-            #   Narrow phase: SAT on rotated convex hulls
-            frame_max_j = 0.0
-            nb = len(bodies)
-            wv = [b.world_verts() for b in bodies]   # cache world verts
-            for i in range(nb):
-                a = bodies[i]
-                for j in range(i + 1, nb):
-                    bb = bodies[j]
-                    rr = a.radius + bb.radius
-                    if vdist2((a.px, a.py), (bb.px, bb.py)) > rr * rr:
-                        continue
-                    hit, n, d = sat_test(wv[i], wv[j])
-                    if hit:
-                        cp = _contact_pt(wv[i], wv[j], n)
-                        imp = resolve_pair(a, bb, n, d, cp)
-                        if imp > 0 and click_sound and args.sound:
-                            vol = min(1.0, max(0.05, math.log1p(imp) / 7.0))
-                            click_sound.set_volume(vol)
-                            click_sound.play()
-                        frame_max_j = max(frame_max_j, imp)
-
-            # ---- Wall collisions (fresh verts after body-body resolution) ----
-            for b in bodies:
-                if b is dragged_body:
-                    continue
-                wj = handle_walls(b, args.width, args.height, goal)
-                if wj > 0 and click_sound and args.sound:
-                    vol = min(1.0, max(0.05, math.log1p(wj) / 7.0))
-                    click_sound.set_volume(vol)
-                    click_sound.play()
-                frame_max_j = max(frame_max_j, wj)
-
-            # ---- Goal: exit detection ----
-            if goal:
-                gl, gr = goal
-                exited = [i for i, b in enumerate(bodies)
-                          if b is not dragged_body and gl < b.px < gr and b.py < 0]
-                for i in reversed(exited):
-                    b = bodies.pop(i)
-                    # Store velocity, omega, AND mass/inertia so we can
-                    # conserve kinetic energy when the new glyph differs.
-                    respawn_queue.append([random.uniform(1.0, 4.0),
-                                         b.vx, b.vy, b.omega,
-                                         b.mass, b.inertia])
-                    goal_score += 1
-                    if goal_exit_sound:
-                        goal_exit_sound.play()
-
-            # ---- Goal: respawn queue ----
-            if respawn_queue:
-                for entry in respawn_queue[:]:
-                    entry[0] -= dt
-                    if entry[0] <= 0:
-                        respawn_queue.remove(entry)
-                        _, evx, evy, eomega, emass, einertia = entry
-                        ch = random.choice(usable)
-                        gx = random.uniform(goal[0] + 20, goal[1] - 20)
-                        color = _bright_color() if args.colorful else base_color
-                        newb = make_body(ch, outlines[ch], pg_font,
-                                         (gx, args.font_size * 0.6),
-                                         (0, 0),   # placeholder, set below
-                                         args.restitution, color)
-                        if newb is not None:
-                            # Scale velocity to conserve kinetic energy:
-                            #   0.5*m_old*v_old^2 = 0.5*m_new*v_new^2
-                            #   v_new = v_old * sqrt(m_old / m_new)
-                            vs = math.sqrt(emass / newb.mass)
-                            ws = math.sqrt(einertia / newb.inertia)
-                            vy_in = abs(evy) if evy < 0 else evy
-                            newb.vx = evx * vs
-                            newb.vy = vy_in * vs
-                            newb.omega = -eomega * ws
-                            bodies.append(newb)
-                            if goal_enter_sound:
-                                goal_enter_sound.play()
+            # Fixed-timestep substep loop: accumulate wall-clock time and
+            # drain it in fixed PHYS_DT bites.  Runs as many substeps as
+            # the CPU can fit before the frame-time budget runs out.  If
+            # physics can't keep up (spiral of death), the leftover
+            # accumulator is clamped so the simulation slows down
+            # gracefully instead of freezing.
+            phys_accum += dt
+            # Use up to 80% of frame time for physics, leave 20% for
+            # rendering + event handling.  No fixed step cap.
+            frame_deadline = time.perf_counter() + dt * 0.8
+            substeps = 0
+            while phys_accum >= PHYS_DT:
+                if substeps >= 4 and time.perf_counter() >= frame_deadline:
+                    break          # out of time -- render what we have
+                phys_accum -= PHYS_DT
+                _physics_step(PHYS_DT)
+                substeps += 1
+            # If we broke out early, clamp the accumulator so we don't
+            # build up a debt that can never be repaid.
+            if phys_accum > PHYS_DT * 4:
+                phys_accum = 0.0
 
         # ---- Render ----
         screen.fill((12, 12, 20))
