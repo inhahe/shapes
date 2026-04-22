@@ -27,6 +27,9 @@ Interactive keys:
     D                   --  toggle convex-hull debug overlay
     G                   --  toggle gravity (0 <-> 500 px/s^2)
     S                   --  toggle collision sound (when --sound is available)
+
+Interactive mouse:
+    Left-click + drag   --  grab and fling any glyph; it collides with others
 """
 
 from __future__ import annotations
@@ -1069,7 +1072,7 @@ def main():
     vsync_str = "vsync" if use_vsync else "60fps"
     sound_str = "  S=sound toggle" if click_sound else ""
     print(f"Display          : {args.width}x{args.height} {vsync_str}")
-    print(f"Controls: ESC=quit  SPACE=pause  D=debug  G=gravity{sound_str}")
+    print(f"Controls: ESC=quit  SPACE=pause  D=debug  G=gravity  LMB=drag{sound_str}")
 
     # ---- HUD font ----
     try:
@@ -1083,6 +1086,13 @@ def main():
     debug = args.debug
     gravity = args.gravity
     goal_score = 0
+
+    # ---- Mouse drag state ----
+    dragged_body = None
+    drag_offset_x = 0.0
+    drag_offset_y = 0.0
+    drag_vel_x = 0.0
+    drag_vel_y = 0.0
 
     while running:
         # vsync: flip() already blocked, just measure dt.
@@ -1108,6 +1118,72 @@ def main():
                 elif ev.key == pygame.K_s:
                     if click_sound:
                         args.sound = not args.sound
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                mx, my = ev.pos
+                # Check bodies in reverse order (topmost rendered last)
+                for idx in range(len(bodies) - 1, -1, -1):
+                    b = bodies[idx]
+                    wv_b = b.world_verts()
+                    xs = [v[0] for v in wv_b]
+                    ys = [v[1] for v in wv_b]
+                    if min(xs) <= mx <= max(xs) and min(ys) <= my <= max(ys):
+                        dragged_body = b
+                        drag_offset_x = b.px - mx
+                        drag_offset_y = b.py - my
+                        drag_vel_x = b.vx
+                        drag_vel_y = b.vy
+                        # Move to end so it renders on top
+                        bodies.pop(idx)
+                        bodies.append(b)
+                        # Infinite mass while dragging -- other bodies
+                        # bounce off but the dragged body stays put
+                        b.inv_mass = 0.0
+                        b.inv_inertia = 0.0
+                        break
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                if dragged_body is not None:
+                    # Restore real mass
+                    dragged_body.inv_mass = 1.0 / dragged_body.mass
+                    dragged_body.inv_inertia = 1.0 / dragged_body.inertia
+                    # Cap release speed to prevent physics explosions
+                    spd = math.sqrt(drag_vel_x ** 2 + drag_vel_y ** 2)
+                    max_spd = 2000.0
+                    if spd > max_spd:
+                        s = max_spd / spd
+                        drag_vel_x *= s
+                        drag_vel_y *= s
+                    dragged_body.vx = drag_vel_x
+                    dragged_body.vy = drag_vel_y
+                    dragged_body = None
+
+        # ---- Update dragged body position (runs even when paused) ----
+        if dragged_body is not None:
+            # Safety: release if body was removed (goal exit) or mouse
+            # button released while window was unfocused
+            if dragged_body not in bodies or not pygame.mouse.get_pressed()[0]:
+                if dragged_body in bodies:
+                    dragged_body.inv_mass = 1.0 / dragged_body.mass
+                    dragged_body.inv_inertia = 1.0 / dragged_body.inertia
+                    dragged_body.vx = drag_vel_x
+                    dragged_body.vy = drag_vel_y
+                dragged_body = None
+            else:
+                mx, my = pygame.mouse.get_pos()
+                new_px = mx + drag_offset_x
+                new_py = my + drag_offset_y
+                if dt > 1e-6:
+                    inst_vx = (new_px - dragged_body.px) / dt
+                    inst_vy = (new_py - dragged_body.py) / dt
+                    # Time-based exponential smoothing (~100ms window)
+                    alpha = min(1.0, dt / 0.1)
+                    drag_vel_x = drag_vel_x * (1.0 - alpha) + inst_vx * alpha
+                    drag_vel_y = drag_vel_y * (1.0 - alpha) + inst_vy * alpha
+                dragged_body.px = new_px
+                dragged_body.py = new_py
+                # Set velocity so collision response uses the drag speed
+                dragged_body.vx = drag_vel_x
+                dragged_body.vy = drag_vel_y
+                dragged_body.omega = 0.0
 
         if paused:
             # Still draw, but skip physics
@@ -1116,6 +1192,8 @@ def main():
             # ---- Integrate ----
             TAU = math.tau
             for b in bodies:
+                if b is dragged_body:
+                    continue
                 b.vy += gravity * dt
                 b.px += b.vx * dt
                 b.py += b.vy * dt
@@ -1146,6 +1224,8 @@ def main():
 
             # ---- Wall collisions (fresh verts after body-body resolution) ----
             for b in bodies:
+                if b is dragged_body:
+                    continue
                 wj = handle_walls(b, args.width, args.height, goal)
                 if wj > 0 and click_sound and args.sound:
                     vol = min(1.0, max(0.05, math.log1p(wj) / 7.0))
@@ -1157,7 +1237,7 @@ def main():
             if goal:
                 gl, gr = goal
                 exited = [i for i, b in enumerate(bodies)
-                          if gl < b.px < gr and b.py < 0]
+                          if b is not dragged_body and gl < b.px < gr and b.py < 0]
                 for i in reversed(exited):
                     b = bodies.pop(i)
                     # Store velocity, omega, AND mass/inertia so we can
@@ -1243,6 +1323,23 @@ def main():
         if debug:
             hud += "  |  DEBUG"
         hud_font.render_to(screen, (8, 6), hud, fgcolor=(90, 90, 110))
+
+        # ---- Cursor feedback for draggable bodies ----
+        if dragged_body is not None:
+            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_SIZEALL)
+        else:
+            mx, my = pygame.mouse.get_pos()
+            hover = False
+            for b in reversed(bodies):
+                wv_b = b.world_verts()
+                xs = [v[0] for v in wv_b]
+                ys = [v[1] for v in wv_b]
+                if min(xs) <= mx <= max(xs) and min(ys) <= my <= max(ys):
+                    hover = True
+                    break
+            pygame.mouse.set_cursor(
+                pygame.SYSTEM_CURSOR_HAND if hover
+                else pygame.SYSTEM_CURSOR_ARROW)
 
         pygame.display.flip()
 

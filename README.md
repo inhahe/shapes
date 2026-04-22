@@ -84,7 +84,9 @@ python bouncing_glyphs.py --chars "HELLO" --count 5 --font-size 100
 | `--debug` | off | Draw convex-hull wireframes (yellow) and centroid crosses (red) over each glyph. Useful for seeing exactly what the physics engine "sees". |
 | `--seed N` | random | RNG seed for reproducible runs. Same seed = same initial positions, velocities, characters, and colours. |
 
-## Interactive keys
+## Interactive controls
+
+### Keyboard
 
 | Key | Action |
 |---|---|
@@ -93,6 +95,16 @@ python bouncing_glyphs.py --chars "HELLO" --count 5 --font-size 100
 | **D** | Toggle debug overlay (convex hulls + centroids) |
 | **G** | Toggle gravity on/off (0 or 500 px/s^2) |
 | **S** | Toggle collision sound on/off (when `--sound` is available) |
+
+### Mouse
+
+| Action | Effect |
+|---|---|
+| **Left-click + drag** | Grab a glyph by its bounding box and drag it around. While held, the glyph has infinite mass -- other glyphs bounce off it realistically based on your drag speed. The cursor changes to a hand when hovering over a draggable glyph, and to a move icon while dragging. |
+| **Release** | Fling the glyph with the velocity you were dragging at (smoothed over ~100 ms so it feels responsive, capped at 2000 px/s). |
+
+Dragging works even while paused -- you can reposition glyphs and they will
+launch with your drag velocity when you unpause.
 
 ## How the physics works
 
