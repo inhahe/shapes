@@ -1381,7 +1381,15 @@ def main():
                 sdt = now - last_phys
                 last_phys = now
                 if sdt > 1e-7:
-                    _physics_step(sdt)
+                    # Cap individual steps so fast/spinning bodies
+                    # don't penetrate deeply before collision fires.
+                    # At 2000 px/s and 4 ms, max movement = 8 px —
+                    # well within the smallest glyph radius.
+                    while sdt > 0.004:
+                        _physics_step(0.004)
+                        sdt -= 0.004
+                    if sdt > 1e-7:
+                        _physics_step(sdt)
 
         pygame.display.flip()                  # vsync wait
 
