@@ -130,14 +130,14 @@ Each glyph goes through this pipeline:
      A thin `I` has very different rotational inertia than a round `O`.
 
 4. **Continuous variable-dt physics** -- physics is decoupled from the
-   display refresh rate.  Between renders, a tight loop runs as many physics
-   steps as the CPU can fit.  The time split is measured, not guessed: each
-   frame, the engine times how long rendering actually took (rolling average)
-   and gives *everything else* to physics.  Each step uses the real
-   nanosecond-precision elapsed time (`time.perf_counter()`) since the
-   previous step -- no fixed rate, no accumulator.  The first step each
-   frame naturally absorbs the render/flip gap from the previous frame, so
-   sim-time stays synchronised with wall-clock time automatically.
+   display refresh rate.  Each frame renders first, then a tight loop runs
+   as many physics steps as the CPU can fit in the remaining time before
+   the next vsync.  Because rendering is already finished, the available
+   time is known exactly -- no estimation or prediction needed.  Each step
+   uses the real nanosecond-precision elapsed time (`time.perf_counter()`)
+   since the previous step -- no fixed rate, no accumulator.  The first
+   step each frame naturally absorbs the render/flip gap from the previous
+   frame, so sim-time stays synchronised with wall-clock time automatically.
    Baumgarte positional-correction parameters are scaled by `dt` so
    collision response is stable at any step size.
 

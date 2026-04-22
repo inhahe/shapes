@@ -1110,7 +1110,6 @@ def main():
 
     # ---- Physics timing ----
     last_phys = time.perf_counter()
-    render_cost = 0.003           # rolling estimate of render+flip time (seed 3 ms)
 
     def _physics_step(sdt):
         """One fixed-timestep physics substep."""
@@ -1203,6 +1202,7 @@ def main():
             dt = min(clock.tick() / 1000.0, 1.0 / 30.0)
         else:
             dt = min(clock.tick(60) / 1000.0, 1.0 / 30.0)
+        frame_start = time.perf_counter()
 
         # ---- Events ----
         for ev in pygame.event.get():
@@ -1287,31 +1287,8 @@ def main():
                 dragged_body.vy = drag_vel_y
                 dragged_body.omega = 0.0
 
-        if paused:
-            # Still draw, but skip physics.  Reset the physics clock so
-            # unpause doesn't see a huge dt from the entire pause.
-            last_phys = time.perf_counter()
-        else:
-            # Continuous variable-dt physics: run as many steps as the
-            # CPU can fit before it's time to render.  Each step uses
-            # the real nanosecond-precision elapsed time since the last
-            # step.  The first step each frame naturally absorbs the
-            # render/flip gap from the previous frame, so sim-time
-            # stays synchronised with wall-clock time -- no accumulator,
-            # no fixed rate, no budget.
-            #
-            # We reserve just enough time for rendering (measured from
-            # the previous frame) and give everything else to physics.
-            phys_deadline = time.perf_counter() + dt - render_cost * 1.2
-            while time.perf_counter() < phys_deadline:
-                now = time.perf_counter()
-                sdt = now - last_phys
-                last_phys = now
-                if sdt > 1e-7:
-                    _physics_step(sdt)
-
-        # ---- Render (timed so physics knows how much room to leave) ----
-        render_t0 = time.perf_counter()
+        # ---- Render (before physics so we know exactly how much
+        #      time remains -- no estimation or prediction needed) ----
         screen.fill((12, 12, 20))
 
         for b in bodies:
@@ -1375,8 +1352,38 @@ def main():
                 pygame.SYSTEM_CURSOR_HAND if hover
                 else pygame.SYSTEM_CURSOR_ARROW)
 
-        pygame.display.flip()
-        render_cost = render_cost * 0.9 + (time.perf_counter() - render_t0) * 0.1
+        # ---- Physics (fills all remaining time before vsync) ----
+        if paused:
+            # Reset the physics clock so unpause doesn't see a huge dt.
+            last_phys = time.perf_counter()
+        else:
+            # Continuous variable-dt physics: rendering is already done,
+            # so we know exactly how much time is left in this frame.
+            # Run as many steps as the CPU can fit.  Each step uses the
+            # real nanosecond-precision elapsed time since the last step.
+            # The first step each frame naturally absorbs the render/flip
+            # gap from the previous frame, keeping sim-time synchronised
+            # with wall-clock time.  The budget is capped to one vsync
+            # interval so a single missed vsync can't cascade.
+            #
+            # The 2 ms margin covers two things that sit between the
+            # vsync signal and our flip() call:
+            #   - frame_start is stamped AFTER the vsync (flip-return
+            #     + clock.tick + perf_counter), so frame_start + budget
+            #     overshoots the next vsync by that gap (~0.1-1 ms).
+            #   - The physics loop can overshoot by up to one step
+            #     (a step that passes the deadline check but finishes
+            #     after it, ~0.1-0.5 ms in CPython).
+            frame_budget = min(dt, 1.0 / 60.0)
+            phys_deadline = frame_start + frame_budget - 0.002
+            while time.perf_counter() < phys_deadline:
+                now = time.perf_counter()
+                sdt = now - last_phys
+                last_phys = now
+                if sdt > 1e-7:
+                    _physics_step(sdt)
+
+        pygame.display.flip()                  # vsync wait
 
     pygame.quit()
 
