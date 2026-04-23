@@ -457,6 +457,196 @@ function dpSimplifyOpen(pts,eps){
 }
 
 // =====================================================================
+//  Convex Decomposition (Bayazit algorithm with hole bridging)
+// =====================================================================
+
+// Ensure polygon has positive signed area (CW in screen Y-down coords)
+function ensureCW(pts){
+  if(contourArea(pts)<0)pts.reverse();
+  return pts;
+}
+
+// Check if vertex i is reflex in a CW (positive-area) polygon
+function isReflex(pts,i){
+  const n=pts.length;
+  const prev=pts[(i-1+n)%n],curr=pts[i],next=pts[(i+1)%n];
+  return cross2(vsub2(curr,prev),vsub2(next,curr))<-1e-10;
+}
+
+// Check if a polygon is convex
+function isPolyConvex(pts){
+  if(pts.length<=3)return true;
+  const n=pts.length;
+  let pos=0,neg=0;
+  for(let i=0;i<n;i++){
+    const j=(i+1)%n,k=(i+2)%n;
+    const c=cross2(vsub2(pts[j],pts[i]),vsub2(pts[k],pts[j]));
+    if(c>1e-10)pos++;
+    else if(c<-1e-10)neg++;
+  }
+  return pos===0||neg===0;
+}
+
+// Point-in-polygon (ray casting)
+function ptInPoly(pt,poly){
+  let inside=false;
+  const[px,py]=pt;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const[xi,yi]=poly[i],[xj,yj]=poly[j];
+    if((yi>py)!==(yj>py)&&px<(xj-xi)*(py-yi)/(yj-yi)+xi)
+      inside=!inside;
+  }
+  return inside;
+}
+
+// Proper segment intersection (excludes endpoint touching)
+function segsIntersect(a1,a2,b1,b2){
+  const d1=cross2(vsub2(b2,b1),vsub2(a1,b1));
+  const d2=cross2(vsub2(b2,b1),vsub2(a2,b1));
+  const d3=cross2(vsub2(a2,a1),vsub2(b1,a1));
+  const d4=cross2(vsub2(a2,a1),vsub2(b2,a1));
+  if(((d1>0&&d2<0)||(d1<0&&d2>0))&&
+     ((d3>0&&d4<0)||(d3<0&&d4>0)))return true;
+  return false;
+}
+
+// Bayazit convex decomposition of a simple polygon (CW in screen coords)
+function bayazitDecompose(poly,maxDepth){
+  if(maxDepth===undefined)maxDepth=30;
+  if(poly.length<3)return[];
+  if(poly.length===3||isPolyConvex(poly))return[poly];
+  if(maxDepth<=0)return[convexHull(poly)];
+  const n=poly.length;
+  let ri=-1;
+  for(let i=0;i<n;i++){
+    if(isReflex(poly,i)){ri=i;break;}
+  }
+  if(ri===-1)return[poly];
+  const rp=poly[ri];
+  let bestJ=-1,bestDist=Infinity;
+  for(let j=0;j<n;j++){
+    if(j===ri||j===(ri+1)%n||j===(ri-1+n)%n)continue;
+    const p=poly[j];
+    let valid=true;
+    for(let k=0;k<n&&valid;k++){
+      const k2=(k+1)%n;
+      if(k===ri||k2===ri||k===j||k2===j)continue;
+      if(segsIntersect(rp,p,poly[k],poly[k2]))valid=false;
+    }
+    if(!valid)continue;
+    const mid=[(rp[0]+p[0])/2,(rp[1]+p[1])/2];
+    if(!ptInPoly(mid,poly))continue;
+    const d=vdist2sq(rp,p);
+    if(d<bestDist){bestDist=d;bestJ=j;}
+  }
+  if(bestJ===-1)return[convexHull(poly)];
+  const lo=Math.min(ri,bestJ),hi=Math.max(ri,bestJ);
+  const poly1=poly.slice(lo,hi+1);
+  const poly2=[...poly.slice(hi),...poly.slice(0,lo+1)];
+  const result=[];
+  if(poly1.length>=3)result.push(...bayazitDecompose(poly1,maxDepth-1));
+  if(poly2.length>=3)result.push(...bayazitDecompose(poly2,maxDepth-1));
+  return result;
+}
+
+// Bridge holes into outer contour to create a single simple polygon
+function bridgeHoles(outer,holes){
+  let result=outer.slice();
+  const sorted=[...holes].sort((a,b)=>{
+    const maxA=Math.max(...a.map(p=>p[0]));
+    const maxB=Math.max(...b.map(p=>p[0]));
+    return maxB-maxA;
+  });
+  for(const hole of sorted){
+    let hIdx=0;
+    for(let i=1;i<hole.length;i++){
+      if(hole[i][0]>hole[hIdx][0]||(hole[i][0]===hole[hIdx][0]&&hole[i][1]<hole[hIdx][1]))
+        hIdx=i;
+    }
+    const hp=hole[hIdx];
+    let bestDist=Infinity,bestOIdx=-1;
+    for(let i=0;i<result.length;i++){
+      const d=vdist2sq(hp,result[i]);
+      if(d>=bestDist)continue;
+      let visible=true;
+      for(let k=0;k<result.length&&visible;k++){
+        const k2=(k+1)%result.length;
+        if(k===i||k2===i)continue;
+        if(segsIntersect(hp,result[i],result[k],result[k2]))visible=false;
+      }
+      for(let k=0;k<hole.length&&visible;k++){
+        const k2=(k+1)%hole.length;
+        if(k===hIdx||k2===hIdx)continue;
+        if(segsIntersect(hp,result[i],hole[k],hole[k2]))visible=false;
+      }
+      if(visible){bestDist=d;bestOIdx=i;}
+    }
+    if(bestOIdx===-1)continue;
+    const bridged=[];
+    for(let i=0;i<=bestOIdx;i++)bridged.push(result[i]);
+    for(let i=0;i<hole.length;i++)bridged.push(hole[(hIdx+i)%hole.length]);
+    bridged.push(hole[hIdx]);
+    bridged.push(result[bestOIdx]);
+    for(let i=bestOIdx+1;i<result.length;i++)bridged.push(result[i]);
+    result=bridged;
+  }
+  return result;
+}
+
+// Full convex decomposition of a glyph's contours
+function convexDecompose(contours){
+  if(contours.length===0)return null;
+  if(contours.length===1){
+    const poly=contours[0].slice();
+    ensureCW(poly);
+    const parts=bayazitDecompose(poly);
+    return parts.length>0?parts.filter(p=>p.length>=3&&Math.abs(contourArea(p))>4):null;
+  }
+  // Determine nesting via containment (even-odd: odd depth = hole)
+  const isHole=new Array(contours.length).fill(false);
+  for(let i=0;i<contours.length;i++){
+    let depth=0;
+    for(let j=0;j<contours.length;j++){
+      if(i===j)continue;
+      if(ptInPoly(contours[i][0],contours[j]))depth++;
+    }
+    isHole[i]=(depth%2===1);
+  }
+  const areas=contours.map(c=>Math.abs(contourArea(c)));
+  const outers=[],holeGroups=[];
+  for(let i=0;i<contours.length;i++){
+    if(!isHole[i]){outers.push(i);holeGroups.push([]);}
+  }
+  for(let i=0;i<contours.length;i++){
+    if(!isHole[i])continue;
+    let bestOuter=-1,bestArea=Infinity;
+    for(let oi=0;oi<outers.length;oi++){
+      if(ptInPoly(contours[i][0],contours[outers[oi]])){
+        if(areas[outers[oi]]<bestArea){bestArea=areas[outers[oi]];bestOuter=oi;}
+      }
+    }
+    if(bestOuter>=0)holeGroups[bestOuter].push(i);
+  }
+  const allParts=[];
+  for(let oi=0;oi<outers.length;oi++){
+    let poly=contours[outers[oi]].slice();
+    ensureCW(poly);
+    const holes=holeGroups[oi].map(hi=>{
+      const h=contours[hi].slice();
+      if(contourArea(h)>0)h.reverse();
+      return h;
+    });
+    if(holes.length>0){
+      poly=bridgeHoles(poly,holes);
+      ensureCW(poly);
+    }
+    const parts=bayazitDecompose(poly);
+    allParts.push(...parts.filter(p=>p.length>=3&&Math.abs(contourArea(p))>4));
+  }
+  return allParts.length>0?allParts:null;
+}
+
+// =====================================================================
 //  Marching-squares contour tracing on rasterized glyph
 // =====================================================================
 function traceGlyphContours(px,w,h){
@@ -605,6 +795,9 @@ function extractGlyph(ch, fontFamily, fontSize){
     if(bxMax-bxMin<minDim||byMax-byMin<minDim)continue;
     smoothedPixel.push(dpSimplifyContour(c,0.8));
   }
+  // Convex decomposition for accurate collision shape
+  const rawParts=convexDecompose(smoothedPixel);
+  const parts=rawParts?rawParts.map(part=>part.map(p=>[p[0]-pcx,p[1]-pcy])):null;
   // Redraw the canvas to match the marching-squares contours exactly.
   // Canvas 2D even-odd fill automatically handles holes (O, B, etc.).
   ctx.clearRect(0,0,w,h);
@@ -628,7 +821,7 @@ function extractGlyph(ch, fontFamily, fontSize){
   const gw=maxX-minX+1, gh=maxY-minY+1;
   const radius=Math.max(...local.map(v=>vlen2(v)));
   return{
-    ch, hull, local, props, contours,
+    ch, hull, local, parts, props, contours,
     cx:cx2, cy:cy2,
     texCanvas:tc, texW:w, texH:h,
     glyphW:gw, glyphH:gh,
@@ -773,6 +966,7 @@ class Body2D{
     this.inertia=glyph.inertia;
     this.invInertia=1/this.inertia;
     this.localVerts=glyph.local;
+    this.localParts=glyph.parts||[glyph.local]; // convex parts for collision
     this.radius=glyph.radius;
     this.color=color;
     this.restitution=restitution;
@@ -784,6 +978,12 @@ class Body2D{
   worldVerts(){
     const c=Math.cos(this.angle),s=Math.sin(this.angle);
     return this.localVerts.map(([lx,ly])=>[lx*c-ly*s+this.px,lx*s+ly*c+this.py]);
+  }
+  worldParts(){
+    const c=Math.cos(this.angle),s=Math.sin(this.angle);
+    return this.localParts.map(part=>
+      part.map(([lx,ly])=>[lx*c-ly*s+this.px,lx*s+ly*c+this.py])
+    );
   }
 }
 
@@ -984,6 +1184,9 @@ class Body3D{
     // Convex hull in 3D local frame (y-flipped for y-up)
     this.localHull=glyph.local.map(([x,y])=>[x,-y]);
     this.halfThick=thickness/2;
+    // Convex parts in 3D local frame (y-flipped for y-up)
+    const rawParts=glyph.parts||[glyph.local];
+    this.localParts=rawParts.map(part=>part.map(([x,y])=>[x,-y]));
     // WebGL mesh data (set up by renderer)
     this.glMesh=null;
     this.glTexture=null;
@@ -1027,6 +1230,39 @@ function prismSATAxes(body){
   const cap=quatRotateVec(q,[0,0,1]);
   fN.push(cap);  // front/back cap normal
   eD.push(cap);  // extrusion edge direction
+  return{fN,eD};
+}
+
+// Part-based variants for convex decomposition collision
+function worldPrismVertsPart(body,part){
+  const ht=body.halfThick,q=body.quat;
+  const px=body.px,py=body.py,pz=body.pz;
+  const n=part.length,verts=new Array(n*2);
+  for(let i=0;i<n;i++){
+    const hx=part[i][0],hy=part[i][1];
+    const f=quatRotateVec(q,[hx,hy,ht]);
+    const b=quatRotateVec(q,[hx,hy,-ht]);
+    verts[i*2]=[f[0]+px,f[1]+py,f[2]+pz];
+    verts[i*2+1]=[b[0]+px,b[1]+py,b[2]+pz];
+  }
+  return verts;
+}
+function prismSATAxesPart(body,part){
+  const q=body.quat;
+  const fN=[],eD=[];
+  const n=part.length;
+  for(let i=0;i<n;i++){
+    const j=(i+1)%n;
+    const dx=part[j][0]-part[i][0],dy=part[j][1]-part[i][1];
+    const L=Math.sqrt(dx*dx+dy*dy);
+    if(L>1e-12){
+      fN.push(quatRotateVec(q,[-dy/L,dx/L,0]));
+      eD.push(quatRotateVec(q,[dx/L,dy/L,0]));
+    }
+  }
+  const cap=quatRotateVec(q,[0,0,1]);
+  fN.push(cap);
+  eD.push(cap);
   return{fN,eD};
 }
 
@@ -1121,12 +1357,24 @@ function resolve3DPair(a,b){
   const dx=b.px-a.px,dy=b.py-a.py,dz=b.pz-a.pz;
   const rr=a.radius+b.radius;
   if(dx*dx+dy*dy+dz*dz>=rr*rr)return 0;
-  // Narrow phase: SAT on actual convex prisms
-  const vA=worldPrismVerts(a), vB=worldPrismVerts(b);
-  const axA=prismSATAxes(a), axB=prismSATAxes(b);
-  const sat=satTest3D(vA,vB,axA,axB,[a.px,a.py,a.pz],[b.px,b.py,b.pz]);
-  if(!sat)return 0;
-  const{n,depth}=sat;
+  // Narrow phase: test all convex part pairs, find deepest overlap
+  const partsA=a.localParts||[a.localHull];
+  const partsB=b.localParts||[b.localHull];
+  let bestSat=null,bestVA=null,bestVB=null;
+  for(const partA of partsA){
+    for(const partB of partsB){
+      const vA=worldPrismVertsPart(a,partA);
+      const vB=worldPrismVertsPart(b,partB);
+      const axA=prismSATAxesPart(a,partA);
+      const axB=prismSATAxesPart(b,partB);
+      const sat=satTest3D(vA,vB,axA,axB,[a.px,a.py,a.pz],[b.px,b.py,b.pz]);
+      if(sat&&(!bestSat||sat.depth>bestSat.depth)){
+        bestSat=sat;bestVA=vA;bestVB=vB;
+      }
+    }
+  }
+  if(!bestSat)return 0;
+  const{n,depth}=bestSat;
   // Positional correction (Baumgarte)
   const totalInv=a.invMass+b.invMass;
   if(totalInv<1e-12)return 0;
@@ -1134,7 +1382,7 @@ function resolve3DPair(a,b){
   a.px-=n[0]*corr*a.invMass; a.py-=n[1]*corr*a.invMass; a.pz-=n[2]*corr*a.invMass;
   b.px+=n[0]*corr*b.invMass; b.py+=n[1]*corr*b.invMass; b.pz+=n[2]*corr*b.invMass;
   // Contact point & lever arms
-  const cp=contactPt3D(vA,vB,n);
+  const cp=contactPt3D(bestVA,bestVB,n);
   const ra=vsub3(cp,[a.px,a.py,a.pz]), rb=vsub3(cp,[b.px,b.py,b.pz]);
   // Relative velocity at contact
   const vaC=vadd3([a.vx,a.vy,a.vz],cross3([a.wx,a.wy,a.wz],ra));
@@ -1229,6 +1477,7 @@ function makeStaticRect(cx,cy,cz,hw,hh,ht,rest){
     wx:0,wy:0,wz:0,
     quat:quatIdentity(),
     localHull:hull,
+    localParts:[hull], // single convex part
     halfThick:ht,
     radius:diag,
     mass:Infinity, invMass:0,
@@ -1421,13 +1670,18 @@ function render2D(){
     ctx2d.restore();
 
     if(CFG.debug){
-      const wv=b.worldVerts();
-      if(wv.length>=3){
+      const parts=b.worldParts();
+      const dcolors=['rgba(255,255,0,0.6)','rgba(0,255,255,0.6)','rgba(255,0,255,0.6)',
+                     'rgba(255,128,0,0.6)','rgba(128,255,0,0.6)','rgba(0,128,255,0.6)',
+                     'rgba(255,64,128,0.6)','rgba(128,64,255,0.6)'];
+      for(let pi=0;pi<parts.length;pi++){
+        const wv=parts[pi];
+        if(wv.length<3)continue;
         ctx2d.beginPath();
         ctx2d.moveTo(wv[0][0],wv[0][1]);
-        for(let i=1;i<wv.length;i++)ctx2d.lineTo(wv[i][0],wv[i][1]);
+        for(let k=1;k<wv.length;k++)ctx2d.lineTo(wv[k][0],wv[k][1]);
         ctx2d.closePath();
-        ctx2d.strokeStyle='rgba(255,255,0,0.6)';
+        ctx2d.strokeStyle=dcolors[pi%dcolors.length];
         ctx2d.lineWidth=1;
         ctx2d.stroke();
       }
@@ -1756,23 +2010,48 @@ function buildGoalMesh(){
   if(!SIM.goal||CFG.mode!=='3d'){glGoalVertCount=0;return;}
   const gs=SIM.goal[0]; // half-size
   const D=CFG.depth/2;
-  const t=4; // frame thickness
+  const t=25; // frame bar thickness
+  const fd=Math.max(CFG.thickness,40); // frame depth into the wall
   const verts=[];
-  const n=[0,0,1]; // normal pointing into the box
-  // Square frame on back wall (z=-D)
-  function addQuad(p1,p2,p3,p4){
-    verts.push(...p1,...n,...p2,...n,...p3,...n);
-    verts.push(...p1,...n,...p3,...n,...p4,...n);
+  // Build 3D frame bars with depth so they're visible from all angles
+  function addBox(x1,y1,z1,x2,y2,z2){
+    // Front face (z=z2, toward camera)
+    const nf=[0,0,1];
+    verts.push(x1,y1,z2,...nf,x2,y1,z2,...nf,x2,y2,z2,...nf);
+    verts.push(x1,y1,z2,...nf,x2,y2,z2,...nf,x1,y2,z2,...nf);
+    // Back face (z=z1)
+    const nb=[0,0,-1];
+    verts.push(x2,y1,z1,...nb,x1,y1,z1,...nb,x1,y2,z1,...nb);
+    verts.push(x2,y1,z1,...nb,x1,y2,z1,...nb,x2,y2,z1,...nb);
+    // Top face (y=y2)
+    const nt=[0,1,0];
+    verts.push(x1,y2,z1,...nt,x2,y2,z1,...nt,x2,y2,z2,...nt);
+    verts.push(x1,y2,z1,...nt,x2,y2,z2,...nt,x1,y2,z2,...nt);
+    // Bottom face (y=y1)
+    const nbo=[0,-1,0];
+    verts.push(x1,y1,z2,...nbo,x2,y1,z2,...nbo,x2,y1,z1,...nbo);
+    verts.push(x1,y1,z2,...nbo,x2,y1,z1,...nbo,x1,y1,z1,...nbo);
+    // Right face (x=x2)
+    const nr=[1,0,0];
+    verts.push(x2,y1,z1,...nr,x2,y1,z2,...nr,x2,y2,z2,...nr);
+    verts.push(x2,y1,z1,...nr,x2,y2,z2,...nr,x2,y2,z1,...nr);
+    // Left face (x=x1)
+    const nl=[-1,0,0];
+    verts.push(x1,y1,z2,...nl,x1,y1,z1,...nl,x1,y2,z1,...nl);
+    verts.push(x1,y1,z2,...nl,x1,y2,z1,...nl,x1,y2,z2,...nl);
   }
+  const hw=SIM.W/2,hh=SIM.H/2;
+  const z1=-D-fd,z2=-D; // from behind back wall to flush with it
   // Top bar
-  addQuad([-gs-t,gs+t,-D],[gs+t,gs+t,-D],[gs+t,gs,-D],[-gs-t,gs,-D]);
+  addBox(-gs-t,gs,z1,gs+t,gs+t,z2);
   // Bottom bar
-  addQuad([-gs-t,-gs,-D],[gs+t,-gs,-D],[gs+t,-gs-t,-D],[-gs-t,-gs-t,-D]);
+  addBox(-gs-t,-gs-t,z1,gs+t,-gs,z2);
   // Left bar
-  addQuad([-gs-t,gs,-D],[-gs,gs,-D],[-gs,-gs,-D],[-gs-t,-gs,-D]);
+  addBox(-gs-t,-gs,z1,-gs,gs,z2);
   // Right bar
-  addQuad([gs,gs,-D],[gs+t,gs,-D],[gs+t,-gs,-D],[gs,-gs,-D]);
+  addBox(gs,-gs,z1,gs+t,gs,z2);
   glGoalVertCount=verts.length/6;
+  if(glGoalVBO)gl.deleteBuffer(glGoalVBO);
   glGoalVBO=gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER,glGoalVBO);
   gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(verts),gl.STATIC_DRAW);
@@ -1925,19 +2204,21 @@ function renderScene3D(view,proj){
     gl.drawArrays(gl.TRIANGLES,0,glRoomVertCount);
   }
 
-  // Draw goal frame
+  // Draw goal frame (disable culling — visible from all angles)
   if(glGoalVBO&&glGoalVertCount>0){
+    gl.disable(gl.CULL_FACE);
     gl.useProgram(glProgram);
     const mvp=mat4Multiply(proj,view);
     gl.uniformMatrix4fv(gl.getUniformLocation(glProgram,'uMVP'),false,mvp);
     gl.uniformMatrix4fv(gl.getUniformLocation(glProgram,'uMV'),false,view);
     gl.uniformMatrix3fv(gl.getUniformLocation(glProgram,'uNormalMat'),false,mat3NormalFromMat4(view));
-    gl.uniform3fv(gl.getUniformLocation(glProgram,'uColor'),[0.3,0.8,0.3]);
+    gl.uniform3fv(gl.getUniformLocation(glProgram,'uColor'),[0.4,1.0,0.4]);
     gl.uniform3fv(gl.getUniformLocation(glProgram,'uLightDir'),lightDir);
     gl.bindBuffer(gl.ARRAY_BUFFER,glGoalVBO);
     gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);
     gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);
     gl.drawArrays(gl.TRIANGLES,0,glGoalVertCount);
+    gl.enable(gl.CULL_FACE);
   }
 
   // Draw glyphs
@@ -2145,18 +2426,26 @@ function physicsStep2D(dt){
     b.angle=(b.angle+b.omega*dt)%TAU;
   }
 
-  // Body-body collisions
+  // Body-body collisions (using convex parts for accurate shape)
   const nb=bodies.length;
-  const wv=bodies.map(b=>b.worldVerts());
+  const wp=bodies.map(b=>b.worldParts());
   for(let i=0;i<nb;i++){
     for(let j=i+1;j<nb;j++){
       const a=bodies[i],bB=bodies[j];
       const rr=a.radius+bB.radius;
       if(vdist2sq([a.px,a.py],[bB.px,bB.py])>rr*rr)continue;
-      const res=satTest(wv[i],wv[j]);
-      if(res){
-        const cp=contactPt(wv[i],wv[j],res.n);
-        const imp=resolvePair2D(a,bB,res.n,res.depth,cp,dt);
+      let bestRes=null,bestCP=null;
+      for(const pa of wp[i]){
+        for(const pb of wp[j]){
+          const res=satTest(pa,pb);
+          if(res&&(!bestRes||res.depth>bestRes.depth)){
+            bestRes=res;
+            bestCP=contactPt(pa,pb,res.n);
+          }
+        }
+      }
+      if(bestRes){
+        const imp=resolvePair2D(a,bB,bestRes.n,bestRes.depth,bestCP,dt);
         if(imp>0)playClick(Math.min(1,Math.max(0.05,Math.log1p(imp)/7)));
       }
     }
@@ -2609,7 +2898,23 @@ function setupUI(){
   });
   document.getElementById('chkColorful').addEventListener('change',e=>{CFG.colorful=e.target.checked;});
   document.getElementById('colBg').addEventListener('input',e=>{CFG.bgColor=e.target.value;});
-  document.getElementById('chkGoal').addEventListener('change',e=>{CFG.goal=e.target.checked;});
+  document.getElementById('chkGoal').addEventListener('change',e=>{
+    CFG.goal=e.target.checked;
+    if(SIM.running){
+      if(CFG.goal){
+        if(CFG.mode==='2d'){
+          SIM.goal=[SIM.W/2-CFG.goalWidth/2,SIM.W/2+CFG.goalWidth/2];
+        }else{
+          SIM.goal=[CFG.goalSize/2];
+          rebuildGoalBodies();
+        }
+      }else{
+        SIM.goal=null;
+        SIM.goalBodies=null;
+      }
+      if(CFG.mode==='3d'&&gl&&glInitialized)buildGoalMesh();
+    }
+  });
   document.getElementById('chkSound').addEventListener('change',e=>{CFG.sound=e.target.checked;if(e.target.checked)initAudio();});
   document.getElementById('chkDebug').addEventListener('change',e=>{CFG.debug=e.target.checked;});
   document.getElementById('selStereo').addEventListener('change',e=>{
@@ -2679,6 +2984,7 @@ function resetSim(){
       if(b.glMesh){
         gl.deleteBuffer(b.glMesh.sideVBO);
         gl.deleteBuffer(b.glMesh.faceVBO);
+        if(b.glMesh.capVBO)gl.deleteBuffer(b.glMesh.capVBO);
       }
       if(b.glTexture)gl.deleteTexture(b.glTexture);
     }
