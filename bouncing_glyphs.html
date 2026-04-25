@@ -124,7 +124,7 @@ h2.collapsed::before{transform:rotate(-90deg)}
 <div class="group" id="grpDebug">
   <h2 onclick="toggleGroup(this)">Debug</h2>
   <div class="group-body">
-    <div class="row"><label>Show Hulls</label><input type="checkbox" id="chkDebug"></div>
+    <div class="row"><label>Show Shapes</label><input type="checkbox" id="chkDebug"></div>
   </div>
 </div>
 
@@ -133,6 +133,8 @@ h2.collapsed::before{transform:rotate(-90deg)}
   <div class="group-body">
     <div class="row"><label>Depth</label><input type="range" id="slDepth" min="200" max="2000" value="800"><span class="val" id="vDepth">800</span></div>
     <div class="row"><label>Glyph Depth</label><input type="range" id="slThickness" min="2" max="100" value="20"><span class="val" id="vThickness">20</span></div>
+    <div class="row"><label>Contour Detail</label><input type="range" id="slContour" min="1" max="40" value="8" step="1"><span class="val" id="vContour">0.8</span></div>
+    <div class="info">Lower = smoother contours (needs Reset)</div>
     <div class="row"><label>Perspective</label><input type="range" id="slFOV" min="20" max="120" value="60"><span class="val" id="vFOV">60</span></div>
     <div class="info" id="infoGlyphDepth">window size: <span id="vDimensions">?×?</span> px</div>
     <div class="row"><label>Stereo 3D</label><select id="selStereo" style="width:100%"><option value="none">None</option><option value="anaglyph">Anaglyph (Red-Cyan)</option><option value="cross">Cross-eyed</option><option value="parallel">Parallel (Wall-eyed)</option></select></div>
@@ -188,6 +190,7 @@ const CFG = {
   debug: false,
   depth: 800,
   thickness: 20,
+  contourDetail: 0.8, // Douglas-Peucker epsilon for contour simplification
   fov: 60,           // vertical field of view in degrees
   stereo: 'none',
   screenDist: 60,   // cm
@@ -793,7 +796,7 @@ function extractGlyph(ch, fontFamily, fontSize){
       if(py2<byMin)byMin=py2;if(py2>byMax)byMax=py2;
     }
     if(bxMax-bxMin<minDim||byMax-byMin<minDim)continue;
-    smoothedPixel.push(dpSimplifyContour(c,0.8));
+    smoothedPixel.push(dpSimplifyContour(c,CFG.contourDetail));
   }
   // Convex decomposition for accurate collision shape
   const rawParts=convexDecompose(smoothedPixel);
@@ -1989,8 +1992,20 @@ function buildGridMesh(){
   }
   // Front wall (z=+D): x,y plane
   addQuad([-W,-H,D],[W,-H,D],[W,H,D],[-W,H,D], 0,1);
-  // Back wall (z=-D): x,y plane
-  addQuad([W,-H,-D],[-W,-H,-D],[-W,H,-D],[W,H,-D], 0,1);
+  // Back wall (z=-D): x,y plane — cut hole for goal opening
+  if(SIM.goal&&CFG.goal&&CFG.mode==='3d'){
+    const gs=SIM.goal[0]; // half-size of goal opening
+    // Left strip
+    addQuad([-gs,-H,-D],[-W,-H,-D],[-W,H,-D],[-gs,H,-D], 0,1);
+    // Right strip
+    addQuad([W,-H,-D],[gs,-H,-D],[gs,H,-D],[W,H,-D], 0,1);
+    // Top strip (between left and right)
+    addQuad([gs,gs,-D],[-gs,gs,-D],[-gs,H,-D],[gs,H,-D], 0,1);
+    // Bottom strip (between left and right)
+    addQuad([-gs,-H,-D],[gs,-H,-D],[gs,-gs,-D],[-gs,-gs,-D], 0,1);
+  }else{
+    addQuad([W,-H,-D],[-W,-H,-D],[-W,H,-D],[W,H,-D], 0,1);
+  }
   // Left wall (x=-W): z,y plane
   addQuad([-W,-H,-D],[-W,-H,D],[-W,H,D],[-W,H,-D], 2,1);
   // Right wall (x=+W): z,y plane
@@ -2815,7 +2830,7 @@ function bindSlider(id,valId,prop,transform){
       for(const b of SIM.bodies)b.restitution=v;
     }
     if(prop==='depth'&&gl&&glInitialized){buildRoomMesh();buildGridMesh();if(SIM.goalBodies)rebuildGoalBodies();}
-    if(prop==='goalSize'&&SIM.goal&&CFG.mode==='3d'){SIM.goal=[CFG.goalSize/2];rebuildGoalBodies();buildGoalMesh();}
+    if(prop==='goalSize'&&SIM.goal&&CFG.mode==='3d'){SIM.goal=[CFG.goalSize/2];rebuildGoalBodies();buildGoalMesh();buildGridMesh();}
   });
 }
 function toggleGroup(el){
@@ -2833,6 +2848,7 @@ function setupUI(){
   bindSlider('slFriction','vFriction','friction',v=>v/100);
   bindSlider('slGoalWidth','vGoalWidth','goalWidth');
   bindSlider('slGoalSize','vGoalSize','goalSize');
+  bindSlider('slContour','vContour','contourDetail',v=>v/10);
   bindSlider('slDepth','vDepth','depth');
   bindSlider('slThickness','vThickness','thickness');
   bindSlider('slFOV','vFOV','fov');
@@ -2912,7 +2928,7 @@ function setupUI(){
         SIM.goal=null;
         SIM.goalBodies=null;
       }
-      if(CFG.mode==='3d'&&gl&&glInitialized)buildGoalMesh();
+      if(CFG.mode==='3d'&&gl&&glInitialized){buildGoalMesh();buildGridMesh();}
     }
   });
   document.getElementById('chkSound').addEventListener('change',e=>{CFG.sound=e.target.checked;if(e.target.checked)initAudio();});
