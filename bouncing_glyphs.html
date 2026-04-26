@@ -62,8 +62,8 @@ h2.collapsed::before{transform:rotate(-90deg)}
   <h2 onclick="toggleGroup(this)">Physics</h2>
   <div class="group-body">
     <div class="row"><label>Count</label><input type="range" id="slCount" min="1" max="120" value="15"><span class="val" id="vCount">15</span></div>
-    <div class="row"><label>Speed Min</label><input type="range" id="slSpeedMin" min="0" max="800" value="100"><span class="val" id="vSpeedMin">100</span></div>
-    <div class="row"><label>Speed Max</label><input type="range" id="slSpeedMax" min="10" max="1500" value="400"><span class="val" id="vSpeedMax">400</span></div>
+    <div class="row"><label>Init. Speed Min</label><input type="range" id="slSpeedMin" min="0" max="800" value="100"><span class="val" id="vSpeedMin">100</span></div>
+    <div class="row"><label>Init. Speed Max</label><input type="range" id="slSpeedMax" min="10" max="1500" value="400"><span class="val" id="vSpeedMax">400</span></div>
     <div class="row"><label>Font Size</label><input type="range" id="slFontSize" min="16" max="200" value="72"><span class="val" id="vFontSize">72</span></div>
     <div class="row"><label>Gravity</label><input type="range" id="slGravity" min="0" max="1500" value="0"><span class="val" id="vGravity">0</span></div>
     <div class="row"><label>Restitution</label><input type="range" id="slRestitution" min="0" max="100" value="100" step="1"><span class="val" id="vRestitution">1.00</span></div>
@@ -2078,28 +2078,49 @@ function buildGlyphMesh(body){
   const ht=body.thickness/2;
 
   // ---- Side faces: extrude silhouette contour edges from z=-ht to z=+ht ----
-  // Contours are CW in Y-up space (right-side-first traversal + Y negate).
-  // Outward normals via (dy/len, -dx/len) for CW winding.
+  // Smooth vertex normals: average adjacent edge normals at vertices where the
+  // angle between them is small (curved sections like O, S), keep hard normals
+  // at sharp corners (like L, T, H corners).
   const sides=[];
   const contours=g.contours||[];
+  const SMOOTH_COS=0.34; // ~cos(70°): smooth if angle between normals < 70°
   for(const contour of contours){
     const NC=contour.length;
+    if(NC<3)continue;
+    // Pre-compute per-edge outward face normals (null for degenerate edges)
+    const eN=new Array(NC);
     for(let i=0;i<NC;i++){
-      const p1=contour[i], p2=contour[(i+1)%NC];
-      const dx=p2[0]-p1[0], dy=p2[1]-p1[1];
+      const p1=contour[i],p2=contour[(i+1)%NC];
+      const dx=p2[0]-p1[0],dy=p2[1]-p1[1];
       const len=Math.sqrt(dx*dx+dy*dy);
-      if(len<0.5)continue;
-      // Outward normal for CW contour in Y-up space
-      const nx=dy/len, ny=-dx/len;
-      const n=[nx,ny,0];
-      // Quad corners: back (z=-ht) and front (z=+ht)
-      const a=[p1[0],p1[1],-ht];
-      const b=[p2[0],p2[1],-ht];
-      const c=[p2[0],p2[1], ht];
-      const d=[p1[0],p1[1], ht];
-      // CCW winding for outward-facing normal
-      sides.push(...a,...n,...b,...n,...c,...n);
-      sides.push(...a,...n,...c,...n,...d,...n);
+      eN[i]=len<0.5?null:[dy/len,-dx/len];
+    }
+    for(let i=0;i<NC;i++){
+      if(!eN[i])continue;
+      const n=eN[i];
+      const p1=contour[i],p2=contour[(i+1)%NC];
+      // Left vertex (i): smooth with previous edge normal if angle is small
+      const nP=eN[(i-1+NC)%NC];
+      let nL0=n[0],nL1=n[1];
+      if(nP&&nP[0]*n[0]+nP[1]*n[1]>SMOOTH_COS){
+        const sx=nP[0]+n[0],sy=nP[1]+n[1];
+        const sl=Math.sqrt(sx*sx+sy*sy);
+        if(sl>1e-6){nL0=sx/sl;nL1=sy/sl;}
+      }
+      // Right vertex ((i+1)%NC): smooth with next edge normal if angle is small
+      const nN=eN[(i+1)%NC];
+      let nR0=n[0],nR1=n[1];
+      if(nN&&n[0]*nN[0]+n[1]*nN[1]>SMOOTH_COS){
+        const sx=n[0]+nN[0],sy=n[1]+nN[1];
+        const sl=Math.sqrt(sx*sx+sy*sy);
+        if(sl>1e-6){nR0=sx/sl;nR1=sy/sl;}
+      }
+      // Quad from p1→p2, back (z=-ht) to front (z=+ht), per-vertex normals
+      const nL=[nL0,nL1,0],nR=[nR0,nR1,0];
+      const a=[p1[0],p1[1],-ht],b=[p2[0],p2[1],-ht];
+      const c=[p2[0],p2[1],ht],d=[p1[0],p1[1],ht];
+      sides.push(...a,...nL,...b,...nR,...c,...nR);
+      sides.push(...a,...nL,...c,...nR,...d,...nL);
     }
   }
 
@@ -2265,10 +2286,19 @@ function renderScene3D(view,proj){
 
     // Front/back caps — stencil-based even-odd fill from contour fan.
     // Guarantees cap geometry matches side walls exactly.
+    //
+    // Three-pass approach per cap face:
+    //   Pass 1 (stencil fill): depth test OFF so already-drawn side faces
+    //          don't block the stencil pattern.  Rotated glyphs would
+    //          otherwise get incomplete even-odd fill (holes filled, etc.).
+    //   Pass 2 (draw):  depth test ON (LEQUAL) — cap is only drawn where
+    //          it's actually visible.  Stencil zeroed as we draw.
+    //   Pass 3 (cleanup): depth test OFF — zero any stencil that pass 2
+    //          couldn't clear (pixels where the cap was behind other
+    //          geometry).  Prevents stencil leaking to the next cap/glyph.
     if(b.glMesh.capVBO){
       gl.enable(gl.STENCIL_TEST);
       gl.disable(gl.CULL_FACE);
-      gl.depthFunc(gl.LEQUAL); // avoid z-fighting at cap/side-wall edges
       // Reuse solid shader uniforms (already set above for side walls)
       gl.bindBuffer(gl.ARRAY_BUFFER,b.glMesh.capVBO);
       gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);
@@ -2276,31 +2306,50 @@ function renderScene3D(view,proj){
       gl.disableVertexAttribArray(2);
 
       // --- Front cap (z=+ht) ---
-      // Pass 1: fill stencil with even-odd pattern (no color/depth write)
+      // Pass 1: fill stencil (no depth test, no color/depth write)
+      gl.disable(gl.DEPTH_TEST);
       gl.stencilFunc(gl.ALWAYS,0,0xFF);
       gl.stencilOp(gl.KEEP,gl.KEEP,gl.INVERT);
       gl.colorMask(false,false,false,false);
       gl.depthMask(false);
       gl.drawArrays(gl.TRIANGLES,0,b.glMesh.capFrontCount);
-      // Pass 2: draw solid cap where stencil≠0, clear stencil as we go
+      // Pass 2: draw solid cap where stencil≠0, zero stencil as we go
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
       gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
       gl.stencilOp(gl.KEEP,gl.KEEP,gl.ZERO);
       gl.colorMask(true,true,true,true);
       gl.depthMask(true);
+      gl.drawArrays(gl.TRIANGLES,0,b.glMesh.capFrontCount);
+      // Pass 3: cleanup leftover stencil (no depth test, no color/depth write)
+      gl.disable(gl.DEPTH_TEST);
+      gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
+      gl.stencilOp(gl.ZERO,gl.ZERO,gl.ZERO);
+      gl.colorMask(false,false,false,false);
+      gl.depthMask(false);
       gl.drawArrays(gl.TRIANGLES,0,b.glMesh.capFrontCount);
 
       // --- Back cap (z=-ht) ---
       gl.stencilFunc(gl.ALWAYS,0,0xFF);
       gl.stencilOp(gl.KEEP,gl.KEEP,gl.INVERT);
-      gl.colorMask(false,false,false,false);
-      gl.depthMask(false);
       gl.drawArrays(gl.TRIANGLES,b.glMesh.capFrontCount,b.glMesh.capBackCount);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
       gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
       gl.stencilOp(gl.KEEP,gl.KEEP,gl.ZERO);
       gl.colorMask(true,true,true,true);
       gl.depthMask(true);
       gl.drawArrays(gl.TRIANGLES,b.glMesh.capFrontCount,b.glMesh.capBackCount);
+      gl.disable(gl.DEPTH_TEST);
+      gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
+      gl.stencilOp(gl.ZERO,gl.ZERO,gl.ZERO);
+      gl.colorMask(false,false,false,false);
+      gl.depthMask(false);
+      gl.drawArrays(gl.TRIANGLES,b.glMesh.capFrontCount,b.glMesh.capBackCount);
 
+      gl.enable(gl.DEPTH_TEST);
+      gl.colorMask(true,true,true,true);
+      gl.depthMask(true);
       gl.disable(gl.STENCIL_TEST);
       gl.depthFunc(gl.LESS);
       gl.enable(gl.CULL_FACE);
