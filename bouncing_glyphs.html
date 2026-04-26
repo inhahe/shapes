@@ -42,10 +42,23 @@ h2.collapsed::before{transform:rotate(-90deg)}
 .mode-toggle button.active{background:#3a4a8a;color:#fff;border-color:#5a6aaa}
 .info{font-size:11px;color:#666;margin:2px 0 4px 116px;font-style:italic}
 .hud{position:absolute;top:8px;left:8px;color:rgba(140,140,180,0.7);font:13px/1.3 'Consolas',monospace;pointer-events:none;text-shadow:0 1px 2px rgba(0,0,0,0.8)}
+#sidebarToggle{display:none;position:fixed;top:10px;left:10px;z-index:20;width:44px;height:44px;background:rgba(26,26,46,0.85);border:1px solid #3a3a5e;border-radius:8px;color:#7faaff;font-size:22px;cursor:pointer;line-height:42px;text-align:center;-webkit-backdrop-filter:blur(4px);backdrop-filter:blur(4px);-webkit-tap-highlight-color:transparent}
+#sidebarToggle:active{background:rgba(58,74,138,0.9)}
+#sidebarBackdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:9}
+@media(max-width:768px){
+  #sidebar{position:fixed;top:0;left:0;z-index:10;width:min(320px,85vw);min-width:0;height:100%;transform:translateX(-100%);transition:transform .3s ease;border-right:1px solid #444}
+  #sidebar.open{transform:translateX(0)}
+  #sidebarToggle{display:block}
+  #sidebarBackdrop.visible{display:block}
+  .hud{left:60px!important;font-size:11px!important}
+  .row label{flex:0 0 90px}
+}
 </style>
 </head>
 <body>
 <div id="app">
+<button id="sidebarToggle" onclick="toggleSidebar()">☰</button>
+<div id="sidebarBackdrop" onclick="toggleSidebar()"></div>
 <aside id="sidebar">
 
 <div class="mode-toggle">
@@ -149,7 +162,7 @@ h2.collapsed::before{transform:rotate(-90deg)}
 <div style="margin-top:16px;padding-top:8px;border-top:1px solid #2a2a4e">
   <div style="font-size:11px;color:#555;line-height:1.5">
     <b>Keys:</b> Space=Pause &middot; D=Debug &middot; G=Gravity &middot; S=Sound<br>
-    <b>Mouse:</b> Click+Drag to grab &amp; fling glyphs
+    <b>Mouse/Touch:</b> Click or tap+drag to grab &amp; fling glyphs
   </div>
 </div>
 
@@ -170,7 +183,7 @@ h2.collapsed::before{transform:rotate(-90deg)}
 // =====================================================================
 const CFG = {
   mode: '2d',
-  count: 15,
+  count: 15, countManual: false,
   speedMin: 100, speedMax: 400,
   fontSize: 72,
   gravity: 0,
@@ -973,10 +986,17 @@ class Body2D{
     this.radius=glyph.radius;
     this.color=color;
     this.restitution=restitution;
-    // Pre-render the glyph to an offscreen canvas for fast rotation
-    this.texCanvas=glyph.texCanvas;
     this.texW=glyph.texW; this.texH=glyph.texH;
     this.cx=glyph.cx; this.cy=glyph.cy;
+    // Pre-render colored glyph to an offscreen canvas for fast drawImage each frame
+    const rc=document.createElement('canvas');
+    rc.width=glyph.texW; rc.height=glyph.texH;
+    const rctx=rc.getContext('2d');
+    rctx.font=`${CFG.fontSize}px "${CFG.font}"`;
+    rctx.fillStyle=`rgb(${color[0]},${color[1]},${color[2]})`;
+    rctx.textAlign='center'; rctx.textBaseline='middle';
+    rctx.fillText(ch,glyph.texW/2,glyph.texH/2);
+    this.renderCanvas=rc;
   }
   worldVerts(){
     const c=Math.cos(this.angle),s=Math.sin(this.angle);
@@ -1575,9 +1595,24 @@ function initSim(){
   SIM.goalScore=0;
   SIM.dragBody=null;
 
+  // Auto-compute glyph count proportional to screen area (2D) or room volume (3D)
+  if(!CFG.countManual){
+    let autoCount;
+    if(CFG.mode==='2d'){
+      autoCount=Math.round(SIM.W*SIM.H/46000);
+    }else{
+      autoCount=Math.round(SIM.W*SIM.H*CFG.depth/12300000);
+    }
+    CFG.count=Math.max(3,Math.min(120,autoCount));
+    const sl=document.getElementById('slCount');
+    const vl=document.getElementById('vCount');
+    if(sl)sl.value=CFG.count;
+    if(vl)vl.textContent=CFG.count;
+  }
+
   const W=SIM.W, H=SIM.H, D=CFG.depth;
   const margin=CFG.fontSize*1.2;
-  const count=CFG.mode==='3d'?Math.min(CFG.count*3,120):CFG.count;
+  const count=Math.min(CFG.count,120);
   const baseColor=hexToRgb(CFG.color);
 
   if(CFG.mode==='2d'){
@@ -1654,29 +1689,25 @@ function init2DCanvas(){
 function render2D(){
   if(!ctx2d)return;
   const W=SIM.W, H=SIM.H;
+  ctx2d.setTransform(1,0,0,1,0,0);
   const bg=hexToRgb(CFG.bgColor);
   ctx2d.fillStyle=rgbStr(bg);
   ctx2d.fillRect(0,0,W,H);
 
+  // Draw glyphs using pre-rendered canvases (fast bitmap blit, no per-frame font rasterization)
   for(const b of SIM.bodies){
-    ctx2d.save();
-    ctx2d.translate(b.px,b.py);
-    ctx2d.rotate(b.angle);
-    // Draw the glyph using font rendering (high quality).
-    // Offset so the ink centroid (hull origin) aligns with the body position,
-    // not the typographic center from textAlign/textBaseline.
-    ctx2d.font=`${CFG.fontSize}px "${CFG.font}"`;
-    ctx2d.fillStyle=rgbStr(b.color);
-    ctx2d.textAlign='center';
-    ctx2d.textBaseline='middle';
-    ctx2d.fillText(b.ch,b.texW/2-b.cx,b.texH/2-b.cy);
-    ctx2d.restore();
+    const cs=Math.cos(b.angle),sn=Math.sin(b.angle);
+    ctx2d.setTransform(cs,sn,-sn,cs,b.px,b.py);
+    ctx2d.drawImage(b.renderCanvas,-b.cx,-b.cy);
+  }
+  ctx2d.setTransform(1,0,0,1,0,0);
 
-    if(CFG.debug){
+  if(CFG.debug){
+    const dcolors=['rgba(255,255,0,0.6)','rgba(0,255,255,0.6)','rgba(255,0,255,0.6)',
+                   'rgba(255,128,0,0.6)','rgba(128,255,0,0.6)','rgba(0,128,255,0.6)',
+                   'rgba(255,64,128,0.6)','rgba(128,64,255,0.6)'];
+    for(const b of SIM.bodies){
       const parts=b.worldParts();
-      const dcolors=['rgba(255,255,0,0.6)','rgba(0,255,255,0.6)','rgba(255,0,255,0.6)',
-                     'rgba(255,128,0,0.6)','rgba(128,255,0,0.6)','rgba(0,128,255,0.6)',
-                     'rgba(255,64,128,0.6)','rgba(128,64,255,0.6)'];
       for(let pi=0;pi<parts.length;pi++){
         const wv=parts[pi];
         if(wv.length<3)continue;
@@ -2845,6 +2876,28 @@ function canvasMouseUp(e){
   mouseDown=false;
   releaseDrag();
 }
+// Touch support (reuse mouse handlers with synthetic event objects)
+function canvasTouchStart(e){
+  if(e.touches.length!==1)return;
+  e.preventDefault();
+  canvasMouseDown({clientX:e.touches[0].clientX,clientY:e.touches[0].clientY,button:0});
+}
+function canvasTouchMove(e){
+  if(e.touches.length!==1)return;
+  e.preventDefault();
+  updateMousePos({clientX:e.touches[0].clientX,clientY:e.touches[0].clientY});
+}
+function canvasTouchEnd(e){
+  e.preventDefault();
+  canvasMouseUp({button:0});
+}
+// Sidebar toggle for mobile
+function toggleSidebar(){
+  const sb=document.getElementById('sidebar');
+  const bd=document.getElementById('sidebarBackdrop');
+  const isOpen=sb.classList.toggle('open');
+  bd.classList.toggle('visible',isOpen);
+}
 // Release drag if window loses focus
 window.addEventListener('blur',()=>{mouseDown=false;releaseDrag();});
 
@@ -2987,13 +3040,19 @@ function setupUI(){
     document.getElementById('stereoSettings').style.display=e.target.value==='none'?'none':'';
   });
 
-  // Canvas events
+  // Mark count as manually set when user touches the slider
+  document.getElementById('slCount').addEventListener('input',()=>{CFG.countManual=true;});
+
+  // Canvas events (mouse + touch)
   const c2d=document.getElementById('c2d');
   const c3d=document.getElementById('c3d');
   for(const c of[c2d,c3d]){
     c.addEventListener('mousedown',canvasMouseDown);
     c.addEventListener('mousemove',canvasMouseMove);
     c.addEventListener('mouseup',canvasMouseUp);
+    c.addEventListener('touchstart',canvasTouchStart,{passive:false});
+    c.addEventListener('touchmove',canvasTouchMove,{passive:false});
+    c.addEventListener('touchend',canvasTouchEnd,{passive:false});
     c.addEventListener('contextmenu',e=>e.preventDefault());
   }
 
