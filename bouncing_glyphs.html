@@ -389,6 +389,90 @@ function polygonProps(verts){
 }
 
 // =====================================================================
+//  Multi-contour physical properties (area, centroid, inertia)
+//  Uses Green's theorem with even-odd nesting depth:
+//    depth 0 (outer) → adds, depth 1 (hole) → subtracts,
+//    depth 2 (fill inside hole) → adds, etc.
+// =====================================================================
+function multiContourProps(contours){
+  if(!contours||contours.length===0)return{area:1,cx:0,cy:0,inertia:1,mass:DENSITY};
+
+  // Compute signed area for each contour (for winding detection)
+  const signed=contours.map(c=>contourArea(c));
+
+  // Determine nesting depth of each contour via even-odd containment.
+  // A contour's depth = how many other contours contain its first point.
+  const depths=contours.map((_,i)=>{
+    let depth=0;
+    const testPt=contours[i][0];
+    for(let j=0;j<contours.length;j++){
+      if(j===i)continue;
+      if(ptInPoly(testPt,contours[j]))depth++;
+    }
+    return depth;
+  });
+
+  // Even depth → outer/fill (adds), odd depth → hole (subtracts)
+  let totalArea=0, totalCxN=0, totalCyN=0;
+  const contourProps=[];
+  for(let k=0;k<contours.length;k++){
+    const c=contours[k];
+    const n=c.length;
+    if(n<3){contourProps.push(null);continue;}
+    const sign=(depths[k]%2===0)?1:-1;
+    // Signed area via Green's theorem
+    let sa=0,cxn=0,cyn=0;
+    for(let i=0;i<n;i++){
+      const j=(i+1)%n;
+      const d=c[i][0]*c[j][1]-c[j][0]*c[i][1];
+      sa+=d; cxn+=(c[i][0]+c[j][0])*d; cyn+=(c[i][1]+c[j][1])*d;
+    }
+    sa*=0.5;
+    const absA=Math.abs(sa);
+    if(absA<1e-8){contourProps.push(null);continue;}
+    const cx0=cxn/(6*sa), cy0=cyn/(6*sa);
+    contourProps.push({area:absA,cx:cx0,cy:cy0,sign});
+    totalArea+=sign*absA;
+    totalCxN+=sign*absA*cx0;
+    totalCyN+=sign*absA*cy0;
+  }
+
+  if(totalArea<1e-8)return{area:1,cx:0,cy:0,inertia:1,mass:DENSITY};
+
+  const cx=totalCxN/totalArea, cy=totalCyN/totalArea;
+
+  // Second moment of area about the combined centroid (parallel axis theorem)
+  let totalI=0;
+  for(let k=0;k<contours.length;k++){
+    const cp=contourProps[k];
+    if(!cp)continue;
+    const c=contours[k];
+    const n=c.length;
+    // Moment about contour's own centroid
+    let Ixx=0,Iyy=0;
+    for(let i=0;i<n;i++){
+      const j=(i+1)%n;
+      const xi=c[i][0]-cp.cx,yi=c[i][1]-cp.cy;
+      const xj=c[j][0]-cp.cx,yj=c[j][1]-cp.cy;
+      const d=xi*yj-xj*yi;
+      Ixx+=d*(yi*yi+yi*yj+yj*yj);
+      Iyy+=d*(xi*xi+xi*xj+xj*xj);
+    }
+    Ixx=Math.abs(Ixx/12); Iyy=Math.abs(Iyy/12);
+    const Ic=Ixx+Iyy;
+    // Parallel axis theorem: shift from contour centroid to combined centroid
+    const dx=cp.cx-cx, dy=cp.cy-cy;
+    const Ishifted=Ic+cp.area*(dx*dx+dy*dy);
+    totalI+=cp.sign*Ishifted;
+  }
+
+  const area=Math.abs(totalArea);
+  const mass=DENSITY*area;
+  const inertia=DENSITY*Math.abs(totalI);
+  return{area,cx,cy,inertia:Math.max(inertia,0.01),mass:Math.max(mass,0.01)};
+}
+
+// =====================================================================
 //  Contour simplification (remove collinear points)
 // =====================================================================
 function simplifyContour(pts){
@@ -833,6 +917,9 @@ function extractGlyph(ch, fontFamily, fontSize){
   }
   // Use pixel-based centroid for better accuracy
   const cx2=pcx, cy2=pcy;
+  // Compute mass & inertia from multi-contour Green's theorem (holes subtract,
+  // nested fills add back — even-odd nesting depth).
+  const multiProps=multiContourProps(smoothedPixel);
   // Build canvas texture for this glyph (tight crop with padding for rotation)
   const gw=maxX-minX+1, gh=maxY-minY+1;
   const radius=Math.max(...local.map(v=>vlen2(v)));
@@ -843,8 +930,8 @@ function extractGlyph(ch, fontFamily, fontSize){
     glyphW:gw, glyphH:gh,
     minX, minY, maxX, maxY,
     pixelArea, radius,
-    mass: DENSITY * pixelArea,
-    inertia: Math.max(props.inertia, 0.01)
+    mass: Math.max(multiProps.mass, 0.01),
+    inertia: Math.max(multiProps.inertia, 0.01)
   };
 }
 
@@ -1195,9 +1282,10 @@ class Body3D{
     this.wx=0; this.wy=0; this.wz=0;
     this.mass=glyph.mass;
     this.invMass=1/this.mass;
-    // Approximate inertia as solid box
-    const hw=glyph.glyphW/2, hh=glyph.glyphH/2, ht=thickness/2;
-    this.inertia=this.mass*(hw*hw+hh*hh+ht*ht)/3;
+    // Inertia from actual 2D contour shape + thickness contribution.
+    // For a flat body extruded along Z: I = I_2d + mass * t^2 / 12
+    const ht=thickness/2;
+    this.inertia=glyph.inertia+this.mass*thickness*thickness/12;
     this.invInertia=1/this.inertia;
     this.radius=Math.sqrt(glyph.radius*glyph.radius+ht*ht);
     this.color=color;
@@ -2629,12 +2717,13 @@ function physicsStep3D(dt){
         const color=CFG.colorful?brightColor():hexToRgb(CFG.color);
         const nb3=new Body3D(ch,glyph,[px,py,pz],[0,0,0],color,CFG.restitution,CFG.thickness);
         const vs=Math.sqrt(e.mass/nb3.mass);
+        const ws=Math.sqrt(e.inertia/nb3.inertia);
         nb3.vx=(e.vx||0)*vs;
         nb3.vy=(e.vy||0)*vs;
         nb3.vz=Math.abs(e.vz||100)*vs;
-        nb3.wx=(Math.random()-0.5)*3;
-        nb3.wy=(Math.random()-0.5)*3;
-        nb3.wz=(Math.random()-0.5)*3;
+        nb3.wx=(e.wx||0)*ws;
+        nb3.wy=(e.wy||0)*ws;
+        nb3.wz=(e.wz||0)*ws;
         buildGlyphMesh(nb3);
         bodies.push(nb3);
         playGoalEnter();
