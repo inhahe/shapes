@@ -145,11 +145,11 @@ h2.collapsed::before{transform:rotate(-90deg)}
   <h2 onclick="toggleGroup(this)">3D Settings</h2>
   <div class="group-body">
     <div class="row"><label>Depth</label><input type="range" id="slDepth" min="200" max="2000" value="800"><span class="val" id="vDepth">800</span></div>
+    <div class="info">Room W×H: <span id="vDimensions">?×?</span></div>
     <div class="row"><label>Glyph Depth</label><input type="range" id="slThickness" min="2" max="100" value="20"><span class="val" id="vThickness">20</span></div>
     <div class="row"><label>Contour Detail</label><input type="range" id="slContour" min="1" max="40" value="8" step="1"><span class="val" id="vContour">0.8</span></div>
     <div class="info">Lower = smoother contours (needs Reset)</div>
     <div class="row"><label>Perspective</label><input type="range" id="slFOV" min="20" max="120" value="60"><span class="val" id="vFOV">60</span></div>
-    <div class="info" id="infoGlyphDepth">window size: <span id="vDimensions">?×?</span> px</div>
     <div class="row"><label>Stereo 3D</label><select id="selStereo" style="width:100%"><option value="none">None</option><option value="anaglyph">Anaglyph (Red-Cyan)</option><option value="cross">Cross-eyed</option><option value="parallel">Parallel (Wall-eyed)</option></select></div>
     <div id="stereoSettings" style="display:none">
       <div class="row"><label>Screen Dist (cm)</label><input type="range" id="slScreenDist" min="20" max="150" value="60"><span class="val" id="vScreenDist">60</span></div>
@@ -183,7 +183,7 @@ h2.collapsed::before{transform:rotate(-90deg)}
 // =====================================================================
 const CFG = {
   mode: '2d',
-  count: 15, countManual: false,
+  count: 15, countManual: false, depthManual: false,
   speedMin: 100, speedMax: 400,
   fontSize: 72,
   gravity: 0,
@@ -1595,6 +1595,25 @@ function initSim(){
   SIM.goalScore=0;
   SIM.dragBody=null;
 
+  // Update depth slider range relative to room dimensions
+  const depthMin=Math.max(50,Math.round(Math.min(SIM.W,SIM.H)*0.1));
+  const depthMax=Math.round(Math.max(SIM.W,SIM.H)*3);
+  const slD=document.getElementById('slDepth');
+  if(slD){slD.min=depthMin;slD.max=depthMax;}
+
+  // Auto-compute room depth proportional to window size
+  if(!CFG.depthManual){
+    const autoDepth=Math.round((SIM.W+SIM.H)/2);
+    CFG.depth=Math.max(depthMin,Math.min(depthMax,autoDepth));
+    if(slD)slD.value=CFG.depth;
+    const vd=document.getElementById('vDepth');
+    if(vd)vd.textContent=CFG.depth;
+  }else{
+    // Clamp manual value to new range
+    CFG.depth=Math.max(depthMin,Math.min(depthMax,CFG.depth));
+    if(slD)slD.value=CFG.depth;
+  }
+
   // Auto-compute glyph count proportional to screen area (2D) or room volume (3D)
   if(!CFG.countManual){
     let autoCount;
@@ -2973,8 +2992,9 @@ function setupUI(){
     document.getElementById('stereoSettings').style.display=e.target.value==='none'?'none':'';
   });
 
-  // Mark count as manually set when user touches the slider
+  // Mark count/depth as manually set when user touches the slider
   document.getElementById('slCount').addEventListener('input',()=>{CFG.countManual=true;});
+  document.getElementById('slDepth').addEventListener('input',()=>{CFG.depthManual=true;});
 
   // Canvas events (mouse + touch)
   const c2d=document.getElementById('c2d');
