@@ -28,8 +28,8 @@ automatically to your screen size.
 - **Accurate shape collision** -- convex decomposition (Bayazit) gives precise
   body-body collisions using the actual glyph outline, not a bounding hull
 - **WebGL 3D rendering** -- extruded glyphs with Phong lighting, smooth vertex
-  normals on curved contour edges, stencil-based even-odd cap fill for correct
-  holes (O, @, B, etc.)
+  normals on curved contour edges, textured cap quads with alpha discard for
+  correct holes (O, @, B, etc.)
 - **Stereo 3D** -- anaglyph (red/cyan), cross-eyed, and parallel (wall-eyed)
   modes with configurable IPD, screen distance, and DPI
 - **Goal mode** -- glyphs exit through a goal opening and respawn as new
@@ -107,7 +107,7 @@ through disappear and respawn as new characters after a random delay.
 
 | Setting | Default | Description |
 |---|---|---|
-| Depth | 800 | Room depth in pixels (Z axis). |
+| Depth | auto | Room depth in pixels (Z axis). Auto-scales to window size; manually setting it disables auto-scaling on Reset. |
 | Glyph Depth | 20 | Thickness of extruded glyphs. |
 | Contour Detail | 0.8 | Douglas-Peucker epsilon for silhouette simplification. Lower = smoother curves, more vertices. Requires Reset. |
 | Perspective | 60 | Vertical field of view in degrees. |
