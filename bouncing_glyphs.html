@@ -150,6 +150,7 @@ h2.collapsed::before{transform:rotate(-90deg)}
     <div class="row"><label>Contour Detail</label><input type="range" id="slContour" min="1" max="40" value="8" step="1"><span class="val" id="vContour">0.8</span></div>
     <div class="info">Lower = smoother contours (needs Reset)</div>
     <div class="row"><label>Perspective</label><input type="range" id="slFOV" min="20" max="120" value="60"><span class="val" id="vFOV">60</span></div>
+    <div class="row"><label>Depth color</label><input type="checkbox" id="chkDepthGradient"><input type="color" id="colDepthNear" value="#ff0000" title="Near (front)"><input type="color" id="colDepthFar" value="#0000ff" title="Far (back)"><span style="font-size:11px;color:#888">Color by Z depth</span></div>
     <div class="row"><label>Stereo 3D</label><select id="selStereo" style="width:100%"><option value="none">None</option><option value="anaglyph">Anaglyph (Red-Cyan)</option><option value="cross">Cross-eyed</option><option value="parallel">Parallel (Wall-eyed)</option></select></div>
     <div id="stereoSettings" style="display:none">
       <div class="row"><label>Screen Dist (cm)</label><input type="range" id="slScreenDist" min="20" max="150" value="60"><span class="val" id="vScreenDist">60</span></div>
@@ -195,6 +196,9 @@ const CFG = {
   customChars: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789&@#?!$*%+',
   color: '#ffffff',
   colorful: false,
+  depthGradient: false,
+  depthNearColor: '#ff0000',
+  depthFarColor: '#0000ff',
   bgColor: '#0c0c14',
   goal: false,
   goalWidth: 150,
@@ -996,6 +1000,11 @@ function brightColor(){
   return[Math.round(c[0]),Math.round(c[1]),Math.round(c[2])];
 }
 function rgbStr(c){return`rgb(${c[0]},${c[1]},${c[2]})`}
+function lerpColor(c1,c2,t){
+  return[Math.round(c1[0]+t*(c2[0]-c1[0])),
+         Math.round(c1[1]+t*(c2[1]-c1[1])),
+         Math.round(c1[2]+t*(c2[2]-c1[2]))];
+}
 
 // =====================================================================
 //  Sound Manager (Web Audio API)
@@ -2376,6 +2385,9 @@ function renderScene3D(view,proj){
   }
 
   // Draw glyphs
+  const dgD=CFG.depth;
+  const dgNear=CFG.depthGradient?hexToRgb(CFG.depthNearColor):null;
+  const dgFar=CFG.depthGradient?hexToRgb(CFG.depthFarColor):null;
   for(const b of SIM.bodies){
     if(!b.glMesh)continue;
     // Model matrix: translate + rotate
@@ -2385,7 +2397,14 @@ function renderScene3D(view,proj){
     const mv=mat4Multiply(view,model);
     const mvp=mat4Multiply(proj,mv);
     const nm=mat3NormalFromMat4(mv);
-    const col=[b.color[0]/255,b.color[1]/255,b.color[2]/255];
+    let col;
+    if(dgNear){
+      const zt=Math.max(0,Math.min(1,(b.pz+dgD/2)/dgD)); // 0=back, 1=front
+      const gc=lerpColor(dgFar,dgNear,zt);
+      col=[gc[0]/255,gc[1]/255,gc[2]/255];
+    }else{
+      col=[b.color[0]/255,b.color[1]/255,b.color[2]/255];
+    }
 
     // Side faces (solid shader) — disable culling for non-convex contour back faces
     gl.disable(gl.CULL_FACE);
@@ -3056,6 +3075,9 @@ function setupUI(){
     document.getElementById('colGlyph').value=e.target.value;
   });
   document.getElementById('chkColorful').addEventListener('change',e=>{CFG.colorful=e.target.checked;});
+  document.getElementById('chkDepthGradient').addEventListener('change',e=>{CFG.depthGradient=e.target.checked;});
+  document.getElementById('colDepthNear').addEventListener('input',e=>{CFG.depthNearColor=e.target.value;});
+  document.getElementById('colDepthFar').addEventListener('input',e=>{CFG.depthFarColor=e.target.value;});
   document.getElementById('colBg').addEventListener('input',e=>{CFG.bgColor=e.target.value;});
   document.getElementById('chkGoal').addEventListener('change',e=>{
     CFG.goal=e.target.checked;
