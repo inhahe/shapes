@@ -10,6 +10,10 @@ All collision math -- impulse magnitudes, rotational velocity changes, friction
 Mass and inertia are computed from the true ink area (holes in letters like O,
 A, B are subtracted, nested fills are added back).
 
+## Live demo
+
+**<http://inhahe.com/bouncing_glyphs.html>**
+
 ## Quick start
 
 Open `bouncing_glyphs.html` in any modern browser. No build step, no
