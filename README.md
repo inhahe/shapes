@@ -166,10 +166,11 @@ Glyphs are extruded into prisms and rendered with WebGL:
   them is less than ~70 degrees, giving curved surfaces (like O, S) a smooth
   cylinder-like appearance while preserving hard edges at sharp corners (L, T).
 
-- **Front/back caps** -- stencil-based even-odd fill using fan triangles from
-  the centroid. A three-pass approach (stencil fill with depth test off, draw
-  with depth test on, cleanup pass) ensures correct rendering of holes in
-  characters like @, O, and B at any rotation angle.
+- **Front/back caps** -- textured quads using the glyph's rasterized texture
+  (rendered with Canvas 2D even-odd fill). Alpha discard in the fragment
+  shader makes holes transparent, so characters like @, O, and B render
+  correctly at any rotation angle without stencil tricks or special
+  triangulation.
 
 - **Lighting** -- Phong shading with diffuse + specular + ambient terms.
   Back-face normals are flipped in the fragment shader (`gl_FrontFacing`) so
