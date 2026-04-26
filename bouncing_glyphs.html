@@ -2172,13 +2172,15 @@ function buildGlyphMesh(body){
   faces.push(x0,yBot,ht, 0,0,1, 0,1);
   faces.push(x1,yTop,ht, 0,0,1, 1,0);
   faces.push(x0,yTop,ht, 0,0,1, 0,0);
-  // Back face (z=-ht, farther from camera), mirrored texture
-  faces.push(x1,yBot,-ht, 0,0,-1, 0,1);
-  faces.push(x0,yBot,-ht, 0,0,-1, 1,1);
-  faces.push(x0,yTop,-ht, 0,0,-1, 1,0);
-  faces.push(x1,yBot,-ht, 0,0,-1, 0,1);
-  faces.push(x0,yTop,-ht, 0,0,-1, 1,0);
-  faces.push(x1,yTop,-ht, 0,0,-1, 0,0);
+  // Back face (z=-ht, farther from camera), same UV (geometric mirror)
+  // Same UV as front: viewed from behind, the x-axis naturally flips,
+  // so the texture shows the correct geometric mirror of the letter.
+  faces.push(x1,yBot,-ht, 0,0,-1, 1,1);
+  faces.push(x0,yBot,-ht, 0,0,-1, 0,1);
+  faces.push(x0,yTop,-ht, 0,0,-1, 0,0);
+  faces.push(x1,yBot,-ht, 0,0,-1, 1,1);
+  faces.push(x0,yTop,-ht, 0,0,-1, 0,0);
+  faces.push(x1,yTop,-ht, 0,0,-1, 1,0);
 
   const faceVBO=gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER,faceVBO);
@@ -2194,29 +2196,7 @@ function buildGlyphMesh(body){
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
 
-  // Build cap fan triangles for stencil-based even-odd fill.
-  // For each contour edge, create a fan triangle from the centroid (0,0).
-  // The stencil INVERT trick gives correct even-odd fill for concavities and holes.
-  const capFront=[],capBack=[];
-  for(const contour of contours){
-    const nc=contour.length;
-    for(let i=0;i<nc;i++){
-      const p1=contour[i],p2=contour[(i+1)%nc];
-      // Front cap at z=+ht, normal +Z
-      capFront.push(0,0,ht, 0,0,1, p1[0],p1[1],ht, 0,0,1, p2[0],p2[1],ht, 0,0,1);
-      // Back cap at z=-ht, normal -Z, reversed winding
-      capBack.push(0,0,-ht, 0,0,-1, p2[0],p2[1],-ht, 0,0,-1, p1[0],p1[1],-ht, 0,0,-1);
-    }
-  }
-  const capAll=[...capFront,...capBack];
-  const capVBO=gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER,capVBO);
-  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(capAll),gl.STATIC_DRAW);
-  const capFrontCount=capFront.length/6;
-  const capBackCount=capBack.length/6;
-
-  body.glMesh={sideVBO,sideCount:sides.length/6,faceVBO,faceCount:faces.length/8,
-               capVBO,capFrontCount,capBackCount};
+  body.glMesh={sideVBO,sideCount:sides.length/6,faceVBO,faceCount:faces.length/8};
   body.glTexture=tex;
 }
 
@@ -2315,75 +2295,28 @@ function renderScene3D(view,proj){
     gl.drawArrays(gl.TRIANGLES,0,b.glMesh.sideCount);
     gl.enable(gl.CULL_FACE);
 
-    // Front/back caps — stencil-based even-odd fill from contour fan.
-    // Guarantees cap geometry matches side walls exactly.
-    //
-    // Three-pass approach per cap face:
-    //   Pass 1 (stencil fill): depth test OFF so already-drawn side faces
-    //          don't block the stencil pattern.  Rotated glyphs would
-    //          otherwise get incomplete even-odd fill (holes filled, etc.).
-    //   Pass 2 (draw):  depth test ON (LEQUAL) — cap is only drawn where
-    //          it's actually visible.  Stencil zeroed as we draw.
-    //   Pass 3 (cleanup): depth test OFF — zero any stencil that pass 2
-    //          couldn't clear (pixels where the cap was behind other
-    //          geometry).  Prevents stencil leaking to the next cap/glyph.
-    if(b.glMesh.capVBO){
-      gl.enable(gl.STENCIL_TEST);
-      gl.disable(gl.CULL_FACE);
-      // Reuse solid shader uniforms (already set above for side walls)
-      gl.bindBuffer(gl.ARRAY_BUFFER,b.glMesh.capVBO);
-      gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);
-      gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);
+    // Front/back caps — textured face quads with alpha discard.
+    // The texture was rendered with Canvas 2D even-odd fill, so holes
+    // (O, D, B, @, etc.) are naturally transparent.
+    // Face culling stays ON: each cap is only visible from its own side,
+    // preventing the mirrored back-face texture from showing through the
+    // front face's transparent areas.
+    if(b.glMesh.faceVBO&&b.glTexture){
+      gl.useProgram(glTexProgram);
+      gl.uniformMatrix4fv(gl.getUniformLocation(glTexProgram,'uMVP'),false,mvp);
+      gl.uniformMatrix4fv(gl.getUniformLocation(glTexProgram,'uMV'),false,mv);
+      gl.uniformMatrix3fv(gl.getUniformLocation(glTexProgram,'uNormalMat'),false,nm);
+      gl.uniform3fv(gl.getUniformLocation(glTexProgram,'uColor'),col);
+      gl.uniform3fv(gl.getUniformLocation(glTexProgram,'uLightDir'),lightDir);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D,b.glTexture);
+      gl.uniform1i(gl.getUniformLocation(glTexProgram,'uTex'),0);
+      gl.bindBuffer(gl.ARRAY_BUFFER,b.glMesh.faceVBO);
+      gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,32,0);
+      gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,32,12);
+      gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,2,gl.FLOAT,false,32,24);
+      gl.drawArrays(gl.TRIANGLES,0,b.glMesh.faceCount);
       gl.disableVertexAttribArray(2);
-
-      // --- Front cap (z=+ht) ---
-      // Pass 1: fill stencil (no depth test, no color/depth write)
-      gl.disable(gl.DEPTH_TEST);
-      gl.stencilFunc(gl.ALWAYS,0,0xFF);
-      gl.stencilOp(gl.KEEP,gl.KEEP,gl.INVERT);
-      gl.colorMask(false,false,false,false);
-      gl.depthMask(false);
-      gl.drawArrays(gl.TRIANGLES,0,b.glMesh.capFrontCount);
-      // Pass 2: draw solid cap where stencil≠0, zero stencil as we go
-      gl.enable(gl.DEPTH_TEST);
-      gl.depthFunc(gl.LEQUAL);
-      gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
-      gl.stencilOp(gl.KEEP,gl.KEEP,gl.ZERO);
-      gl.colorMask(true,true,true,true);
-      gl.depthMask(true);
-      gl.drawArrays(gl.TRIANGLES,0,b.glMesh.capFrontCount);
-      // Pass 3: cleanup leftover stencil (no depth test, no color/depth write)
-      gl.disable(gl.DEPTH_TEST);
-      gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
-      gl.stencilOp(gl.ZERO,gl.ZERO,gl.ZERO);
-      gl.colorMask(false,false,false,false);
-      gl.depthMask(false);
-      gl.drawArrays(gl.TRIANGLES,0,b.glMesh.capFrontCount);
-
-      // --- Back cap (z=-ht) ---
-      gl.stencilFunc(gl.ALWAYS,0,0xFF);
-      gl.stencilOp(gl.KEEP,gl.KEEP,gl.INVERT);
-      gl.drawArrays(gl.TRIANGLES,b.glMesh.capFrontCount,b.glMesh.capBackCount);
-      gl.enable(gl.DEPTH_TEST);
-      gl.depthFunc(gl.LEQUAL);
-      gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
-      gl.stencilOp(gl.KEEP,gl.KEEP,gl.ZERO);
-      gl.colorMask(true,true,true,true);
-      gl.depthMask(true);
-      gl.drawArrays(gl.TRIANGLES,b.glMesh.capFrontCount,b.glMesh.capBackCount);
-      gl.disable(gl.DEPTH_TEST);
-      gl.stencilFunc(gl.NOTEQUAL,0,0xFF);
-      gl.stencilOp(gl.ZERO,gl.ZERO,gl.ZERO);
-      gl.colorMask(false,false,false,false);
-      gl.depthMask(false);
-      gl.drawArrays(gl.TRIANGLES,b.glMesh.capFrontCount,b.glMesh.capBackCount);
-
-      gl.enable(gl.DEPTH_TEST);
-      gl.colorMask(true,true,true,true);
-      gl.depthMask(true);
-      gl.disable(gl.STENCIL_TEST);
-      gl.depthFunc(gl.LESS);
-      gl.enable(gl.CULL_FACE);
     }
   }
 
@@ -3108,7 +3041,6 @@ function resetSim(){
       if(b.glMesh){
         gl.deleteBuffer(b.glMesh.sideVBO);
         gl.deleteBuffer(b.glMesh.faceVBO);
-        if(b.glMesh.capVBO)gl.deleteBuffer(b.glMesh.capVBO);
       }
       if(b.glTexture)gl.deleteTexture(b.glTexture);
     }
