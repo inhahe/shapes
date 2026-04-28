@@ -81,6 +81,8 @@ h2.collapsed::before{transform:rotate(-90deg)}
     <div class="row"><label>Gravity</label><input type="range" id="slGravity" min="0" max="1500" value="0"><span class="val" id="vGravity">0</span></div>
     <div class="row"><label>Restitution</label><input type="range" id="slRestitution" min="0" max="100" value="100" step="1"><span class="val" id="vRestitution">1.00</span></div>
     <div class="row"><label>Friction</label><input type="range" id="slFriction" min="0" max="100" value="0" step="1"><span class="val" id="vFriction">0.00</span></div>
+    <div class="row"><label>Attraction</label><input type="range" id="slAttraction" min="0" max="100000" value="0" step="1000"><span class="val" id="vAttraction">0</span></div>
+    <div class="row"><label>Falloff</label><select id="selFalloff" style="width:100%"><option value="square">1/r&sup2; (3-D law)</option><option value="linear">1/r (2-D law)</option></select></div>
   </div>
 </div>
 
@@ -190,6 +192,8 @@ const CFG = {
   gravity: 0,
   restitution: 1.0,
   friction: 0.0,
+  attraction: 0,
+  gravityFalloff: 'square',
   font: 'Arial',
   customFontName: null,
   charSet: 'default',
@@ -356,6 +360,9 @@ function convexHull(points){
 //  Polygon properties (area, centroid, inertia)
 // =====================================================================
 const DENSITY=0.01;
+// Softening distance² for inter-glyph attraction — prevents the force
+// from diverging when two centroids nearly overlap (~10 px min distance).
+const GRAV_SOFTENING2=100.0;
 
 function polygonProps(verts){
   const n=verts.length;
@@ -1791,26 +1798,179 @@ function initSim(){
 }
 
 // =====================================================================
-//  2D Canvas Renderer
+//  2D Renderer (WebGL with Canvas 2D fallback)
 // =====================================================================
 let ctx2d=null;
+let gl2dSpriteVBO=null;
+let gl2dLocs=null;     // uniform/attrib locations for sprite program
+
 function init2DCanvas(){
-  const c=document.getElementById('c2d');
-  c.classList.remove('hidden');
-  document.getElementById('c3d').classList.add('hidden');
-  c.width=SIM.W; c.height=SIM.H;
-  ctx2d=c.getContext('2d');
+  // Try WebGL first for smooth frame delivery
+  const c3d=document.getElementById('c3d');
+  const c2d=document.getElementById('c2d');
+  c2d.classList.add('hidden');
+  c3d.classList.remove('hidden');
+  c3d.width=SIM.W; c3d.height=SIM.H;
+
+  gl2d=c3d.getContext('webgl',{antialias:true,alpha:false,stencil:true})||c3d.getContext('experimental-webgl',{antialias:true,alpha:false,stencil:true});
+  if(gl2d){
+    gl2dProgram=linkProgram(gl2d,VS_SPRITE,FS_SPRITE,['aQuad']);
+    if(!gl2dProgram){gl2d=null;}
+  }
+  if(gl2d){
+    // Cache uniform locations
+    const p=gl2dProgram;
+    gl2dLocs={
+      aQuad:gl2d.getAttribLocation(p,'aQuad'),
+      uPos:gl2d.getUniformLocation(p,'uPos'),
+      uSize:gl2d.getUniformLocation(p,'uSize'),
+      uPivot:gl2d.getUniformLocation(p,'uPivot'),
+      uCos:gl2d.getUniformLocation(p,'uCos'),
+      uSin:gl2d.getUniformLocation(p,'uSin'),
+      uScreen:gl2d.getUniformLocation(p,'uScreen'),
+      uTex:gl2d.getUniformLocation(p,'uTex'),
+    };
+    // Unit quad VBO: two triangles, (0,0)-(1,0)-(1,1)-(0,0)-(1,1)-(0,1)
+    gl2dSpriteVBO=gl2d.createBuffer();
+    gl2d.bindBuffer(gl2d.ARRAY_BUFFER,gl2dSpriteVBO);
+    gl2d.bufferData(gl2d.ARRAY_BUFFER,new Float32Array([0,0,1,0,1,1,0,0,1,1,0,1]),gl2d.STATIC_DRAW);
+    gl2d.disable(gl2d.DEPTH_TEST);
+    gl2d.disable(gl2d.CULL_FACE);
+    gl2dInitialized=true;
+    ctx2d=null;
+    // Upload textures for existing bodies
+    for(const b of SIM.bodies)upload2DTexture(b);
+  }else{
+    // Fallback: Canvas 2D
+    c3d.classList.add('hidden');
+    c2d.classList.remove('hidden');
+    c2d.width=SIM.W; c2d.height=SIM.H;
+    ctx2d=c2d.getContext('2d');
+    gl2dInitialized=false;
+  }
+}
+
+function upload2DTexture(body){
+  if(!gl2d)return;
+  if(body.gl2dTex)gl2d.deleteTexture(body.gl2dTex);
+  const tex=gl2d.createTexture();
+  gl2d.bindTexture(gl2d.TEXTURE_2D,tex);
+  gl2d.pixelStorei(gl2d.UNPACK_PREMULTIPLY_ALPHA_WEBGL,false);
+  gl2d.texImage2D(gl2d.TEXTURE_2D,0,gl2d.RGBA,gl2d.RGBA,gl2d.UNSIGNED_BYTE,body.renderCanvas);
+  gl2d.texParameteri(gl2d.TEXTURE_2D,gl2d.TEXTURE_MIN_FILTER,gl2d.LINEAR);
+  gl2d.texParameteri(gl2d.TEXTURE_2D,gl2d.TEXTURE_MAG_FILTER,gl2d.LINEAR);
+  gl2d.texParameteri(gl2d.TEXTURE_2D,gl2d.TEXTURE_WRAP_S,gl2d.CLAMP_TO_EDGE);
+  gl2d.texParameteri(gl2d.TEXTURE_2D,gl2d.TEXTURE_WRAP_T,gl2d.CLAMP_TO_EDGE);
+  body.gl2dTex=tex;
 }
 
 function render2D(){
+  if(gl2dInitialized)return render2DWebGL();
   if(!ctx2d)return;
+  render2DCanvas();
+}
+
+function render2DWebGL(){
+  const g=gl2d, L=gl2dLocs;
+  const W=SIM.W, H=SIM.H;
+  const bg=hexToRgb(CFG.bgColor);
+  g.bindFramebuffer(g.FRAMEBUFFER,null);
+  g.viewport(0,0,W,H);
+  g.disable(g.DEPTH_TEST);
+  g.disable(g.CULL_FACE);
+  g.enable(g.BLEND);
+  g.blendFunc(g.SRC_ALPHA,g.ONE_MINUS_SRC_ALPHA);
+  g.clearColor(bg[0]/255,bg[1]/255,bg[2]/255,1);
+  g.clear(g.COLOR_BUFFER_BIT);
+
+  g.useProgram(gl2dProgram);
+  g.bindBuffer(g.ARRAY_BUFFER,gl2dSpriteVBO);
+  g.enableVertexAttribArray(L.aQuad);
+  g.vertexAttribPointer(L.aQuad,2,g.FLOAT,false,0,0);
+  g.uniform2f(L.uScreen,W,H);
+  g.activeTexture(g.TEXTURE0);
+  g.uniform1i(L.uTex,0);
+
+  for(const b of SIM.bodies){
+    if(!b.gl2dTex)upload2DTexture(b);
+    const cs=Math.cos(b.angle),sn=Math.sin(b.angle);
+    g.uniform2f(L.uPos,b.px,b.py);
+    g.uniform2f(L.uSize,b.texW,b.texH);
+    g.uniform2f(L.uPivot,b.cx,b.cy);
+    g.uniform1f(L.uCos,cs);
+    g.uniform1f(L.uSin,sn);
+    g.bindTexture(g.TEXTURE_2D,b.gl2dTex);
+    g.drawArrays(g.TRIANGLES,0,6);
+  }
+
+  // Debug overlay (drawn with Canvas 2D overlay if needed)
+  if(CFG.debug||SIM.goal){
+    render2DOverlay();
+  }else{
+    const oc=document.getElementById('c2dOverlay');
+    if(oc)oc.remove();
+  }
+}
+
+function render2DOverlay(){
+  // Lazy-create a transparent overlay canvas for debug wireframes & goal
+  let oc=document.getElementById('c2dOverlay');
+  if(!oc){
+    oc=document.createElement('canvas');
+    oc.id='c2dOverlay';
+    oc.style.cssText='position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;';
+    document.getElementById('canvasWrap').appendChild(oc);
+  }
+  if(oc.width!==SIM.W||oc.height!==SIM.H){oc.width=SIM.W;oc.height=SIM.H;}
+  const ctx=oc.getContext('2d');
+  ctx.clearRect(0,0,SIM.W,SIM.H);
+
+  if(CFG.debug){
+    const dcolors=['rgba(255,255,0,0.6)','rgba(0,255,255,0.6)','rgba(255,0,255,0.6)',
+                   'rgba(255,128,0,0.6)','rgba(128,255,0,0.6)','rgba(0,128,255,0.6)',
+                   'rgba(255,64,128,0.6)','rgba(128,64,255,0.6)'];
+    for(const b of SIM.bodies){
+      const parts=b.worldParts();
+      for(let pi=0;pi<parts.length;pi++){
+        const wv=parts[pi];
+        if(wv.length<3)continue;
+        ctx.beginPath();
+        ctx.moveTo(wv[0][0],wv[0][1]);
+        for(let k=1;k<wv.length;k++)ctx.lineTo(wv[k][0],wv[k][1]);
+        ctx.closePath();
+        ctx.strokeStyle=dcolors[pi%dcolors.length];
+        ctx.lineWidth=1;
+        ctx.stroke();
+      }
+      ctx.fillStyle='rgba(255,80,80,0.8)';
+      ctx.fillRect(b.px-3,b.py-1,6,2);
+      ctx.fillRect(b.px-1,b.py-3,2,6);
+    }
+  }
+
+  if(SIM.goal){
+    const[gL,gR]=SIM.goal;
+    const postH=35;
+    ctx.fillStyle='rgba(80,180,80,0.15)';
+    ctx.fillRect(gL,0,gR-gL,4);
+    ctx.strokeStyle='rgb(80,200,80)';
+    ctx.lineWidth=3;
+    ctx.beginPath();ctx.moveTo(gL,0);ctx.lineTo(gL,postH);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(gR,0);ctx.lineTo(gR,postH);ctx.stroke();
+    for(let qi=0;qi<SIM.respawnQueue.length;qi++){
+      const dx=gL+(gR-gL)*(qi+1)/(SIM.respawnQueue.length+1);
+      ctx.beginPath();ctx.arc(dx,12,3,0,Math.PI*2);ctx.fillStyle='rgb(80,200,80)';ctx.fill();
+    }
+  }
+}
+
+function render2DCanvas(){
   const W=SIM.W, H=SIM.H;
   ctx2d.setTransform(1,0,0,1,0,0);
   const bg=hexToRgb(CFG.bgColor);
   ctx2d.fillStyle=rgbStr(bg);
   ctx2d.fillRect(0,0,W,H);
 
-  // Draw glyphs using pre-rendered canvases (fast bitmap blit, no per-frame font rasterization)
   for(const b of SIM.bodies){
     const cs=Math.cos(b.angle),sn=Math.sin(b.angle);
     ctx2d.setTransform(cs,sn,-sn,cs,b.px,b.py);
@@ -1841,18 +2001,17 @@ function render2D(){
     }
   }
 
-  // Goal rendering
   if(SIM.goal&&CFG.mode==='2d'){
-    const[gl,gr]=SIM.goal;
+    const[gL,gR]=SIM.goal;
     const postH=35;
     ctx2d.fillStyle='rgba(80,180,80,0.15)';
-    ctx2d.fillRect(gl,0,gr-gl,4);
+    ctx2d.fillRect(gL,0,gR-gL,4);
     ctx2d.strokeStyle='rgb(80,200,80)';
     ctx2d.lineWidth=3;
-    ctx2d.beginPath();ctx2d.moveTo(gl,0);ctx2d.lineTo(gl,postH);ctx2d.stroke();
-    ctx2d.beginPath();ctx2d.moveTo(gr,0);ctx2d.lineTo(gr,postH);ctx2d.stroke();
+    ctx2d.beginPath();ctx2d.moveTo(gL,0);ctx2d.lineTo(gL,postH);ctx2d.stroke();
+    ctx2d.beginPath();ctx2d.moveTo(gR,0);ctx2d.lineTo(gR,postH);ctx2d.stroke();
     for(let qi=0;qi<SIM.respawnQueue.length;qi++){
-      const dx=gl+(gr-gl)*(qi+1)/(SIM.respawnQueue.length+1);
+      const dx=gL+(gR-gL)*(qi+1)/(SIM.respawnQueue.length+1);
       ctx2d.beginPath();ctx2d.arc(dx,12,3,0,Math.PI*2);ctx2d.fillStyle='rgb(80,200,80)';ctx2d.fill();
     }
   }
@@ -1862,6 +2021,9 @@ function render2D(){
 //  WebGL Renderer
 // =====================================================================
 let gl=null, glProgram=null, glTexProgram=null, glCompositeProgram=null, glGridProgram=null, glLineProgram=null;
+let gl2dProgram=null;   // simple 2D sprite shader
+let gl2d=null;          // WebGL context for 2D mode (may share c3d canvas)
+let gl2dInitialized=false;
 let glFBOs=[], glQuadVBO=null, glLineVBO=null;
 let glRoomVBO=null, glRoomVertCount=0;
 let glGoalVBO=null, glGoalVertCount=0;
@@ -2002,6 +2164,33 @@ void main(){
   vec2 g=fract(vUV);
   if(g.x>lw.x&&g.x<1.0-lw.x&&g.y>lw.y&&g.y<1.0-lw.y) discard;
   gl_FragColor=vec4(uColor,0.18);
+}`;
+
+// ── Simple 2-D sprite shaders (orthographic, one textured quad per glyph) ──
+const VS_SPRITE=`
+attribute vec2 aQuad;
+uniform vec2 uPos;
+uniform vec2 uSize;
+uniform vec2 uPivot;
+uniform float uCos;
+uniform float uSin;
+uniform vec2 uScreen;
+varying vec2 vUV;
+void main(){
+  vec2 local=aQuad*uSize-uPivot;
+  vec2 r=vec2(local.x*uCos-local.y*uSin, local.x*uSin+local.y*uCos);
+  vec2 clip=(r+uPos)/uScreen*2.0-vec2(1.0);
+  gl_Position=vec4(clip.x,-clip.y,0.0,1.0);
+  vUV=aQuad;
+}`;
+const FS_SPRITE=`
+precision mediump float;
+varying vec2 vUV;
+uniform sampler2D uTex;
+void main(){
+  vec4 c=texture2D(uTex,vUV);
+  if(c.a<0.01)discard;
+  gl_FragColor=c;
 }`;
 
 function compileShader(g,src,type){
@@ -2571,6 +2760,37 @@ function physicsStep2D(dt){
   const bodies=SIM.bodies;
   const TAU=Math.PI*2;
 
+  // Inter-glyph gravitational attraction
+  if(CFG.attraction>0){
+    const lin=CFG.gravityFalloff==='linear';
+    const G=CFG.attraction;
+    const nb0=bodies.length;
+    for(let i=0;i<nb0;i++){
+      const a=bodies[i];
+      if(a===SIM.dragBody)continue;
+      for(let j=i+1;j<nb0;j++){
+        const bB=bodies[j];
+        const dx=bB.px-a.px, dy=bB.py-a.py;
+        let r2=dx*dx+dy*dy;
+        if(r2<GRAV_SOFTENING2)r2=GRAV_SOFTENING2;
+        let for_;  // F/r  (force magnitude divided by distance, for direction)
+        if(lin){
+          const ir=1/Math.sqrt(r2);
+          for_=G*ir*ir;        // G/r  * 1/r
+        }else{
+          const ir2=1/r2;
+          for_=G*ir2/Math.sqrt(r2); // G/r² * 1/r
+        }
+        a.vx+=for_*bB.mass*dx*dt;
+        a.vy+=for_*bB.mass*dy*dt;
+        if(bB!==SIM.dragBody){
+          bB.vx-=for_*a.mass*dx*dt;
+          bB.vy-=for_*a.mass*dy*dt;
+        }
+      }
+    }
+  }
+
   // Integrate
   for(const b of bodies){
     if(b===SIM.dragBody)continue;
@@ -2658,6 +2878,39 @@ function physicsStep2D(dt){
 function physicsStep3D(dt){
   const W=SIM.W, H=SIM.H, D=CFG.depth;
   const bodies=SIM.bodies;
+
+  // Inter-glyph gravitational attraction (3D)
+  if(CFG.attraction>0){
+    const lin=CFG.gravityFalloff==='linear';
+    const G=CFG.attraction;
+    const nb0=bodies.length;
+    for(let i=0;i<nb0;i++){
+      const a=bodies[i];
+      if(a===SIM.dragBody)continue;
+      for(let j=i+1;j<nb0;j++){
+        const bB=bodies[j];
+        const dx=bB.px-a.px, dy=bB.py-a.py, dz=bB.pz-a.pz;
+        let r2=dx*dx+dy*dy+dz*dz;
+        if(r2<GRAV_SOFTENING2)r2=GRAV_SOFTENING2;
+        let for_;
+        if(lin){
+          const ir=1/Math.sqrt(r2);
+          for_=G*ir*ir;
+        }else{
+          const ir2=1/r2;
+          for_=G*ir2/Math.sqrt(r2);
+        }
+        a.vx+=for_*bB.mass*dx*dt;
+        a.vy+=for_*bB.mass*dy*dt;
+        a.vz+=for_*bB.mass*dz*dt;
+        if(bB!==SIM.dragBody){
+          bB.vx-=for_*a.mass*dx*dt;
+          bB.vy-=for_*a.mass*dy*dt;
+          bB.vz-=for_*a.mass*dz*dt;
+        }
+      }
+    }
+  }
 
   // Integrate
   for(const b of bodies){
@@ -2767,7 +3020,6 @@ function physicsStep3D(dt){
 //  / 2ms-margin calculations entirely.
 // =====================================================================
 let lastFrameMs=0;
-let lastPhysMs=0;
 let fpsCounter=0, fpsTime=0, fpsDisplay=0;
 let physStepsPerFrame=0, physStepsDisplay=0;
 
@@ -2792,52 +3044,33 @@ function mainLoop(timestamp){
   updateDrag(dt);
 
   if(SIM.paused){
-    lastPhysMs=performance.now();
     if(CFG.mode==='2d')render2D();else render3D();
     updateHUD();
     return;
   }
 
   // ── Render current state FIRST ──
-  // In 3D this goes to a triple-buffered FBO, so the display
-  // continues showing the previous completed frame while we
-  // spend the rest of this callback on physics.
   if(CFG.mode==='2d')render2D();
   else render3D();
 
-  // ── Physics: fill remaining time ──
-  // Tight loop with real wall-clock dt per step, identical to the
-  // Python version.  No deadline math — just a simple constant
-  // duration, since triple buffering absorbs any overshoot.
-  if(!lastPhysMs)lastPhysMs=performance.now();
+  // ── Physics: deterministic equal-substep loop ──
+  //
+  // Split frame dt into N equal substeps.  Every step gets the exact
+  // same sdt — no per-substep timer calls, no jitter, no adaptation.
+  //
+  // 2D physics is very cheap (~0.02 ms/step) so we use a tiny max-sdt
+  // to get many substeps and high collision accuracy.
+  // 3D physics is heavier (~1-3 ms/step) so we use a larger max-sdt.
+  //
+  // 2D at 60 fps: dt=16.6ms / 0.5ms = 34 steps (cost: ~0.7 ms)
+  // 3D at 60 fps: dt=16.6ms / 3.0ms =  6 steps (cost: ~9 ms)
 
-  // Don't try to catch up from tab-away / long pause
-  if(performance.now()-lastPhysMs>33)lastPhysMs=performance.now()-33;
-
-  const PHYS_BUDGET_MS=14;  // simple constant — no calculation needed
-  const physEnd=performance.now()+PHYS_BUDGET_MS;
-  let steps=0;
-
-  while(performance.now()<physEnd&&steps<500){
-    const stepNow=performance.now();
-    let sdt=(stepNow-lastPhysMs)/1000;
-    lastPhysMs=stepNow;
-    steps++;
-    if(sdt<0.000050)continue;  // below timer resolution, spin again
-    // Cap individual substeps at 4 ms to prevent deep penetration.
-    // At 2000 px/s and 4 ms, max movement = 8 px — well within
-    // the smallest glyph radius.
-    while(sdt>0.004){
-      if(CFG.mode==='2d')physicsStep2D(0.004);
-      else physicsStep3D(0.004);
-      sdt-=0.004;
-    }
-    if(sdt>0.000050){
-      if(CFG.mode==='2d')physicsStep2D(sdt);
-      else physicsStep3D(sdt);
-    }
-  }
-  physStepsPerFrame+=steps;
+  const MAX_SDT=CFG.mode==='2d'?0.0005:0.003;
+  const nSteps=Math.max(1,Math.ceil(dt/MAX_SDT));
+  const sdt=dt/nSteps;
+  const stepFn=CFG.mode==='2d'?physicsStep2D:physicsStep3D;
+  for(let i=0;i<nSteps;i++)stepFn(sdt);
+  physStepsPerFrame+=nSteps;
 
   updateHUD();
 }
@@ -2897,7 +3130,8 @@ function releaseDrag(){
 }
 
 function getActiveCanvas(){
-  return CFG.mode==='2d'?document.getElementById('c2d'):document.getElementById('c3d');
+  if(CFG.mode==='2d'&&!gl2dInitialized)return document.getElementById('c2d');
+  return document.getElementById('c3d');
 }
 function updateMousePos(e){
   const c=getActiveCanvas();
@@ -2973,6 +3207,9 @@ document.addEventListener('keydown',e=>{
       document.getElementById('slGravity').value=CFG.gravity;
       document.getElementById('vGravity').textContent=CFG.gravity;break;
     case 's':CFG.sound=!CFG.sound;document.getElementById('chkSound').checked=CFG.sound;break;
+    case 'a':{const v=CFG.attraction>0?0:50000;CFG.attraction=v;
+      document.getElementById('slAttraction').value=v;
+      document.getElementById('vAttraction').textContent=v;break;}
     case 'escape':SIM.paused=!SIM.paused;break;
   }
 });
@@ -3008,6 +3245,10 @@ function setupUI(){
   bindSlider('slGravity','vGravity','gravity');
   bindSlider('slRestitution','vRestitution','restitution',v=>v/100);
   bindSlider('slFriction','vFriction','friction',v=>v/100);
+  bindSlider('slAttraction','vAttraction','attraction');
+  document.getElementById('selFalloff').addEventListener('change',e=>{
+    CFG.gravityFalloff=e.target.value;
+  });
   bindSlider('slGoalWidth','vGoalWidth','goalWidth');
   bindSlider('slGoalSize','vGoalSize','goalSize');
   bindSlider('slContour','vContour','contourDetail',v=>v/10);
@@ -3153,7 +3394,7 @@ function toggleRunning(){
     SIM.running=true;
     SIM.paused=false;
     lastFrameMs=0;
-    lastPhysMs=0;
+
     document.getElementById('btnStartStop').textContent='Stop';
     SIM.animId=requestAnimationFrame(mainLoop);
   }
@@ -3166,7 +3407,7 @@ function resetSim(){
     if(SIM.animId)cancelAnimationFrame(SIM.animId);
     SIM.animId=null;
   }
-  // Clean up WebGL resources
+  // Clean up WebGL resources (3D meshes/textures)
   if(gl&&glInitialized){
     for(const b of SIM.bodies){
       if(b.glMesh){
@@ -3176,13 +3417,23 @@ function resetSim(){
       if(b.glTexture)gl.deleteTexture(b.glTexture);
     }
   }
+  // Clean up 2D WebGL textures
+  if(gl2d&&gl2dInitialized){
+    for(const b of SIM.bodies){
+      if(b.gl2dTex)gl2d.deleteTexture(b.gl2dTex);
+    }
+  }
+  gl2dInitialized=false;
   glInitialized=false;
+  // Remove debug overlay if present
+  const oc=document.getElementById('c2dOverlay');
+  if(oc)oc.remove();
   initSim();
   if(wasRunning){
     SIM.running=true;
     SIM.paused=false;
     lastFrameMs=0;
-    lastPhysMs=0;
+
     document.getElementById('btnStartStop').textContent='Stop';
     SIM.animId=requestAnimationFrame(mainLoop);
   }
@@ -3201,9 +3452,14 @@ function handleResize(){
   SIM.W=w; SIM.H=h;
 
   if(CFG.mode==='2d'){
-    const c=document.getElementById('c2d');
-    c.width=w; c.height=h;
-    ctx2d=c.getContext('2d');
+    if(gl2dInitialized){
+      const c=document.getElementById('c3d');
+      c.width=w; c.height=h;
+    }else{
+      const c=document.getElementById('c2d');
+      c.width=w; c.height=h;
+      ctx2d=c.getContext('2d');
+    }
     for(const b of SIM.bodies){b.px*=sx;b.py*=sy;}
     if(SIM.goal){
       SIM.goal=[SIM.goal[0]*sx,SIM.goal[1]*sx];

@@ -20,6 +20,7 @@ Usage:
     python bouncing_glyphs.py --friction 0.3 --gravity 500    (realistic friction + gravity)
     python bouncing_glyphs.py --goal --sound --gravity 400    (goal mode with sounds)
     python bouncing_glyphs.py --color "255,100,0" --font-size 100 --debug
+    python bouncing_glyphs.py --attraction 5e4 --gravity-falloff linear   (2-D attraction)
 
 Interactive keys:
     ESC / close window  --  quit
@@ -27,6 +28,7 @@ Interactive keys:
     D                   --  toggle convex-hull debug overlay
     G                   --  toggle gravity (0 <-> 500 px/s^2)
     S                   --  toggle collision sound (when --sound is available)
+    A                   --  toggle inter-glyph attraction on/off
 
 Interactive mouse:
     Left-click + drag   --  grab and fling any glyph; it collides with others
@@ -564,6 +566,12 @@ def _contact_pt(va, vb, n):
 
 MU_FRICTION = 0.0    # Coulomb friction coefficient (set from CLI)
 
+# Softening length^2 for gravitational attraction -- prevents the force
+# from blowing up when two centroids are nearly coincident (e.g. during an
+# overlap).  Equivalent to clamping the minimum effective distance to
+# sqrt(_GRAV_SOFTENING2) ≈ 10 px.
+_GRAV_SOFTENING2 = 100.0
+
 
 def _apply(body, impulse, r):
     """Apply a linear + angular impulse at lever arm *r* from the centroid."""
@@ -935,6 +943,14 @@ def main():
                          "through disappear and respawn as new random glyphs.")
     ap.add_argument("--goal-width",  default=150, type=int,
                     help="Width of the goal opening in pixels (default: 150)")
+    ap.add_argument("--attraction",  default=0.0, type=float,
+                    help="Inter-glyph gravitational constant G (default: 0 = off; "
+                         "try 5e4 for noticeable pull)")
+    ap.add_argument("--gravity-falloff", default="square", type=str,
+                    choices=["linear", "square"],
+                    help="Distance falloff for --attraction: 'linear' (1/r, "
+                         "physically correct for 2-D) or 'square' (1/r^2, "
+                         "3-D style) (default: square)")
     ap.add_argument("--debug",       action="store_true",
                     help="Draw convex-hull wireframes")
     ap.add_argument("--seed",        default=None, type=int,
@@ -1086,7 +1102,7 @@ def main():
     sound_str = "  S=sound toggle" if click_sound else ""
     print(f"Display          : {args.width}x{args.height} {vsync_str}")
     print(f"Physics          : continuous (variable dt, as fast as CPU allows)")
-    print(f"Controls: ESC=quit  SPACE=pause  D=debug  G=gravity  LMB=drag{sound_str}")
+    print(f"Controls: ESC=quit  SPACE=pause  D=debug  G=gravity  A=attraction  LMB=drag{sound_str}")
 
     # ---- HUD font ----
     try:
@@ -1099,6 +1115,8 @@ def main():
     paused = False
     debug = args.debug
     gravity = args.gravity
+    attraction = args.attraction
+    linear_falloff = (args.gravity_falloff == "linear")
     goal_score = 0
 
     # ---- Mouse drag state ----
@@ -1114,6 +1132,45 @@ def main():
     def _physics_step(sdt):
         """One fixed-timestep physics substep."""
         nonlocal goal_score
+
+        # ---- Inter-glyph gravitational attraction ----
+        if attraction != 0.0:
+            _nb = len(bodies)
+            for _i in range(_nb):
+                a = bodies[_i]
+                if a is dragged_body:
+                    continue
+                for _j in range(_i + 1, _nb):
+                    b2 = bodies[_j]
+                    dx = b2.px - a.px
+                    dy = b2.py - a.py
+                    r2 = dx * dx + dy * dy
+                    if r2 < _GRAV_SOFTENING2:
+                        r2 = _GRAV_SOFTENING2
+                    if linear_falloff:
+                        # 2-D correct: F = G * m1 * m2 / r
+                        inv_r = 1.0 / math.sqrt(r2)
+                        f_over_r = attraction * inv_r * inv_r  # (G*m1*m2/r) * (1/r) for direction
+                    else:
+                        # 3-D style: F = G * m1 * m2 / r^2
+                        inv_r2 = 1.0 / r2
+                        inv_r = math.sqrt(inv_r2)
+                        f_over_r = attraction * inv_r2 * inv_r  # (G*m1*m2/r^2) * (1/r) for direction
+                    # f_over_r already has a factor of 1/r baked in to
+                    # turn the (dx,dy) displacement into a unit direction,
+                    # so  acc_a = f_over_r * m_b * (dx, dy)  /  m_a
+                    #           = f_over_r * (dx, dy) * m_b / m_a
+                    # But since F/m = a, and F = G*m_a*m_b*falloff, a_a = G*m_b*falloff
+                    # We already divided by r once via f_over_r, so just multiply by masses:
+                    acc_ax = f_over_r * b2.mass * dx * sdt
+                    acc_ay = f_over_r * b2.mass * dy * sdt
+                    a.vx += acc_ax
+                    a.vy += acc_ay
+                    if b2 is not dragged_body:
+                        acc_bx = f_over_r * a.mass * dx * sdt
+                        acc_by = f_over_r * a.mass * dy * sdt
+                        b2.vx -= acc_bx
+                        b2.vy -= acc_by
 
         # ---- Integrate ----
         TAU = math.tau
@@ -1220,6 +1277,11 @@ def main():
                 elif ev.key == pygame.K_s:
                     if click_sound:
                         args.sound = not args.sound
+                elif ev.key == pygame.K_a:
+                    if attraction != 0.0:
+                        attraction = 0.0
+                    else:
+                        attraction = args.attraction if args.attraction != 0.0 else 5e4
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 mx, my = ev.pos
                 # Check bodies in reverse order (topmost rendered last)
@@ -1328,7 +1390,11 @@ def main():
         # ---- HUD ----
         fps = clock.get_fps()
         status = "PAUSED" if paused else f"{fps:.0f} fps"
-        hud = f"{status}  |  {len(bodies)} glyphs  |  gravity={'ON' if gravity else 'OFF'}"
+        attract_str = ""
+        if attraction != 0.0 or args.attraction != 0.0:
+            fo = "1/r" if linear_falloff else "1/r²"
+            attract_str = f"  |  attraction={'ON' if attraction else 'OFF'} ({fo})"
+        hud = f"{status}  |  {len(bodies)} glyphs  |  gravity={'ON' if gravity else 'OFF'}{attract_str}"
         if goal:
             hud += f"  |  goals: {goal_score}  queue: {len(respawn_queue)}"
         if debug:

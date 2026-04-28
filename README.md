@@ -32,6 +32,9 @@ automatically to your screen size.
   correct holes (O, @, B, etc.)
 - **Stereo 3D** -- anaglyph (red/cyan), cross-eyed, and parallel (wall-eyed)
   modes with configurable IPD, screen distance, and DPI
+- **Inter-glyph attraction** -- optional gravitational pull between glyphs,
+  with configurable strength and choice of 1/r (2-D law) or 1/r² (3-D law)
+  distance falloff
 - **Goal mode** -- glyphs exit through a goal opening and respawn as new
   characters after a random delay
 - **Collision sound** -- impact-proportional click sounds via Web Audio
@@ -50,6 +53,7 @@ automatically to your screen size.
 | **D** | Toggle debug overlay (convex decomposition shapes + centroids) |
 | **G** | Toggle gravity on/off (0 or 500 px/s^2) |
 | **S** | Toggle collision sound on/off |
+| **A** | Toggle inter-glyph attraction on/off |
 
 ### Mouse / Touch
 
@@ -75,6 +79,8 @@ All settings are in the sidebar (on mobile, tap the ☰ button).
 | Gravity | 0 | Downward acceleration (px/s^2). Try 500 for a tumbling effect. |
 | Restitution | 1.0 | Bounciness. 1.0 = perfectly elastic, 0.0 = perfectly inelastic. |
 | Friction | 0.0 | Coulomb friction coefficient. 0 = frictionless, 0.3 = realistic. |
+| Attraction | 0 | Inter-glyph gravitational constant G. 0 = off, try 5e4 for visible pull. Glyphs attract each other proportional to their masses. |
+| Gravity Falloff | square | Distance law for attraction: `linear` (1/r, correct for a 2-D universe) or `square` (1/r², 3-D-style inverse-square law). |
 
 ### Font
 
@@ -160,6 +166,13 @@ Each glyph goes through this pipeline:
 
 9. **Wall collisions** -- same impulse math, treating each wall/edge as a body
    with infinite mass. Off-centre wall hits impart spin.
+
+10. **Inter-glyph attraction** (optional) -- every pair of bodies experiences a
+    gravitational pull along the line between their centroids. The force is
+    `F = G * m_a * m_b / r^n` where *n* = 1 (linear, physically correct in a
+    2-D universe where field lines spread across a circle, not a sphere) or
+    *n* = 2 (inverse-square, the familiar 3-D law). A softening distance of
+    ~10 px prevents the force from diverging when centroids overlap.
 
 ## 3D rendering
 
