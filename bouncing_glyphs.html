@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Bouncing Glyphs</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -2505,10 +2505,24 @@ function buildGlyphMesh(body){
   body.glTexture=tex;
 }
 
+function getFovRad(){
+  // Mono: FOV is an artistic control (the "Perspective" slider).
+  // Stereo: FOV is physically determined — for orthostereoscopic depth the
+  // virtual camera must subtend the same vertical angle that the physical
+  // screen subtends at the viewer's eye. That angle depends on the screen's
+  // physical height (canvas pixels / DPI) and the viewing distance, so the
+  // "Screen Dist" slider drives it: sit closer -> wider FOV -> stronger 3D.
+  if(CFG.stereo!=='none'){
+    const screenH_mm=SIM.H/CFG.screenDPI*25.4;   // physical screen height
+    const dist_mm=Math.max(1,CFG.screenDist*10); // cm -> mm, guard /0
+    return 2*Math.atan((screenH_mm/2)/dist_mm);
+  }
+  return CFG.fov*Math.PI/180;
+}
 function getCamZ(){
   // Place camera far enough to see the entire room, even in stereo
   // where each eye only gets half the screen width.
-  const D=CFG.depth, fov=CFG.fov*Math.PI/180, tanH=Math.tan(fov/2);
+  const D=CFG.depth, fov=getFovRad(), tanH=Math.tan(fov/2);
   const aspect=SIM.W/SIM.H;
   const stereo=CFG.stereo;
   const effAspect=(stereo==='cross'||stereo==='parallel')?aspect/2:aspect;
@@ -2526,7 +2540,7 @@ function getViewMatrix(eyeX){
   return mat4LookAt([eyeX,0,getCamZ()],[eyeX,0,0],[0,1,0]);
 }
 function getProjMatrix(eyeX,aspect){
-  const fov=CFG.fov*Math.PI/180;
+  const fov=getFovRad();
   if(CFG.stereo!=='none'&&Math.abs(eyeX)>0.01){
     return mat4StereoFrustum(fov,aspect,1,10000,eyeX,getCamZ());
   }

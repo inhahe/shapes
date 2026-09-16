@@ -199,3 +199,9 @@ Glyphs are extruded into prisms and rendered with WebGL:
 |---|---|---|
 | Restitution | Energy lost on the **bounce** (normal direction). 1.0 = perfect bounce, 0.0 = stick. | Coefficient of restitution |
 | Friction | How much an object **slips** at the contact point (tangential direction). Affects spin transfer. 0.0 = ice, 0.3 = rubber. | Coulomb friction coefficient |
+
+
+## License
+
+MIT - see [LICENSE](LICENSE). Free to use, modify and redistribute; provided
+as-is, with no warranty.
