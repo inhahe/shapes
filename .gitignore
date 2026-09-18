@@ -1,0 +1,13 @@
+
+# Local-only. We publish straight from this directory now instead of copying
+# a filtered subset into D:\github, so these are excluded here instead.
+.orchestrator_history
+dist/
+build/
+__pycache__/
+_check.js
+bouncing_glyphs.zip
+copy-to-github.bat
+cptogithub.bat
+todo.txt
+.claude/
