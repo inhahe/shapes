@@ -12,7 +12,7 @@ A, B are subtracted, nested fills are added back).
 
 ## Live demo
 
-**<http://inhahe.com/bouncing_glyphs.html>**
+**<https://inhahe.github.io/shapes/bouncing_glyphs.html>**
 
 ## Quick start
 
